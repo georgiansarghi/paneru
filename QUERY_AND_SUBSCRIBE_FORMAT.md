@@ -135,7 +135,7 @@ Returns only the active display, workspace, and focused-window state.
 | `virtual_workspaces` | array | Virtual workspace rows known to Paneru. |
 | `number` | number | One-based virtual workspace number. |
 | `active` | boolean | Whether this virtual workspace is currently selected. |
-| `windows` | array | Managed windows in this virtual workspace row. |
+| `windows` | array | Managed windows in this virtual workspace row. Native macOS tab groups are represented by their focused/front tab only. |
 | `window_id` | number | Window id. |
 | `bundle_id` | string | Bundle id for the owning application, or an empty string if unknown. |
 | `app_name` | string | Display name for the owning application, or an empty string if unknown. |
@@ -158,8 +158,9 @@ useful for keeping a bar in sync: focus changes, native or virtual workspace
 changes, managed window-list changes, window title changes, and display changes.
 Paneru coalesces duplicate internal events from the same ECS tick and skips
 events whose relevant state has not changed since the last emitted event.
-Consumers should parse each line independently and then call
-`paneru query state --json` when they need a full refresh.
+Consumers should parse each line independently. Structural `windows_changed`
+events include the current virtual-workspace model for immediate rendering;
+call `paneru query state --json` only when a later full reconciliation is needed.
 
 ### Event Types
 
@@ -173,13 +174,14 @@ changes, so integrations receive the event when the visible workspace state
 changes.
 
 ```json
-{"event":"windows_changed","virtual_workspace_number":3,"active":{"display_id":1,"native_workspace_id":4,"virtual_workspace_number":3,"focused_window_id":321,"focused_bundle_id":"com.apple.Terminal","focused_app_name":"Terminal","focused_window_title":"paneru"}}
+{"event":"windows_changed","virtual_workspace_number":3,"active":{"display_id":1,"native_workspace_id":4,"virtual_workspace_number":3,"focused_window_id":321,"focused_bundle_id":"com.apple.Terminal","focused_app_name":"Terminal","focused_window_title":"paneru"},"virtual_workspaces":[{"number":3,"native_workspace_id":4,"active":true,"windows":[{"window_id":321,"bundle_id":"com.apple.Terminal","app_name":"Terminal","title":"paneru","focused":true,"floating":false}]}]}
 ```
 
 Emitted after managed window creation/destruction/minimize/deminimize events and
-after Paneru moves or sends a window between virtual workspaces. The event is
-emitted only when Paneru's virtual workspace/window state differs from the last
-emitted `windows_changed` event.
+after Paneru reorders, stacks, manages, moves, or sends a window between virtual
+workspaces. The event includes `virtual_workspaces` so subscribers can update
+immediately without a separate query, and is emitted only when Paneru's virtual
+workspace/window state differs from the last emitted `windows_changed` event.
 
 ```json
 {"event":"window_focused","window_id":321,"bundle_id":"com.apple.Terminal","title":"paneru","virtual_workspace_number":3}
