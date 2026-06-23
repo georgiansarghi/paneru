@@ -21,7 +21,7 @@ use crate::ecs::{
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
-use crate::platform::WorkspaceId;
+use crate::platform::{WinID, WorkspaceId};
 
 /// Represents a cardinal or directional choice for window manipulation.
 #[derive(Clone, Debug)]
@@ -66,6 +66,10 @@ pub enum MoveFocus {
 pub enum Operation {
     /// Focuses on a window in the specified `Direction`.
     Focus(Direction),
+    /// Focuses the top window in the active strip column at the zero-based index.
+    FocusIndex(u32),
+    /// Focuses the window with the given macOS window id, if it is visible in the active workspace.
+    FocusId(WinID),
     /// Swaps the current window with another in the specified `Direction`.
     Swap(Direction),
     /// Centers the currently focused window on the display.
@@ -141,6 +145,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             manage_window,
             stack_windows_handler,
             command_move_focus,
+            command_focus_index,
+            command_focus_id,
             command_focus_unmanaged,
             command_focus_managed,
             command_raise_floating,
@@ -418,6 +424,67 @@ fn command_move_focus(
             command: Command::Mouse(MouseMove::ToNextDisplay),
         }));
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn command_focus_index(
+    mut messages: MessageReader<Event>,
+    active_display: ActiveDisplay,
+    mut commands: Commands,
+) {
+    let Some(Operation::FocusIndex(index)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusIndex(_))).next()
+    else {
+        return;
+    };
+
+    let Some(entity) = active_display
+        .active_strip()
+        .get(*index as usize)
+        .ok()
+        .and_then(|column| column.top())
+    else {
+        return;
+    };
+
+    commands.focus_entity(entity, true);
+    commands.reshuffle_around(entity);
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn command_focus_id(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let Some(Operation::FocusId(window_id)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusId(_))).next()
+    else {
+        return;
+    };
+
+    let Some((_, entity)) = windows.find(*window_id) else {
+        return;
+    };
+
+    let active_strip = active_display.active_strip();
+    let in_active_strip = active_strip.contains(entity);
+    let visible_float = visible_floating_entities(
+        &windows,
+        &window_manager,
+        active_strip.id(),
+        active_display.bounds(),
+    )
+    .contains(&entity);
+
+    if !(in_active_strip || visible_float) {
+        return;
+    }
+
+    commands.focus_entity(entity, true);
+    commands.reshuffle_around(entity);
 }
 
 #[allow(clippy::needless_pass_by_value)]

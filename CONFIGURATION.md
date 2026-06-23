@@ -125,6 +125,8 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 | `window_focus_west` / `_east` | Focus window to the left/right. |
 | `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. |
+| `window_focus_<number>` | Focus the top window in a numbered strip column. |
+| `window_focusid_<window-id>` | Focus a visible window by macOS window id. Intended for scripts/status bars. |
 | `window_focus_managed` | Switch to a previously focused window on this workspace. |
 | `window_focus_unmanaged` | Switch to a previously focused floating window on this workspace. |
 | `window_swap_west` / `_east` | Swap current window with neighbor. |
@@ -151,6 +153,7 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 ```toml
 [bindings]
 window_focus_west = "cmd - h"
+window_focus_3 = "cmd - 3"
 window_resize = ["alt - r", "ctrl - r"]
 ```
 
@@ -202,6 +205,10 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
 $ paneru send-cmd window virtual north
 # Move the current window to the next virtual workspace.
 $ paneru send-cmd window virtualmove south
+# Focus the top window in strip column 3.
+$ paneru send-cmd window focus 3
+# Focus a visible window by id from `paneru query virtual-workspaces`.
+$ paneru send-cmd window focusid 1781
 # Move directly to virtual workspace 3.
 $ paneru send-cmd window virtualnum 3
 # Move the current window to virtual workspace 3 and follow it.

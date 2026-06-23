@@ -446,8 +446,7 @@ impl PaneruQueryState {
         };
 
         for (child, strip, active_workspace) in workspaces {
-            let row_windows = strip
-                .all_windows()
+            let row_windows = query_window_entities(strip, focused_entity)
                 .iter()
                 .filter_map(|entity| {
                     let (window, _, unmanaged) = windows.get_managed(*entity)?;
@@ -536,6 +535,33 @@ impl PaneruQueryState {
             StateQueryKind::Active => serde_json::to_string(&self.active),
         }
     }
+}
+
+fn query_window_entities(strip: &LayoutStrip, focused_entity: Option<Entity>) -> Vec<Entity> {
+    strip
+        .columns()
+        .flat_map(|column| query_column_entities(column, focused_entity))
+        .collect()
+}
+
+fn query_column_entities(column: &Column, focused_entity: Option<Entity>) -> Vec<Entity> {
+    match column {
+        Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
+        Column::Tabs(tabs) => focused_or_first(tabs, focused_entity).into_iter().collect(),
+        Column::Stack(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                StackItem::Single(entity) => Some(*entity),
+                StackItem::Tabs(tabs) => focused_or_first(tabs, focused_entity),
+            })
+            .collect(),
+    }
+}
+
+fn focused_or_first(entities: &[Entity], focused_entity: Option<Entity>) -> Option<Entity> {
+    focused_entity
+        .filter(|focused| entities.contains(focused))
+        .or_else(|| entities.first().copied())
 }
 
 fn now_timestamp() -> u64 {

@@ -213,6 +213,8 @@ $ paneru send-cmd <command> [args...]
 | Command                    | Description                                      |
 | -------------------------- | ------------------------------------------------ |
 | `window focus <direction>` | Move focus to a window in the given direction    |
+| `window focus <index>`     | Focus the top window in the numbered strip column |
+| `window focusid <id>`      | Focus a visible window by macOS window id        |
 | `window swap <direction>`  | Swap the focused window with a neighbour         |
 | `window center`            | Center the focused window on screen              |
 | `window resize`            | Cycle through `preset_column_widths`             |
@@ -237,6 +239,7 @@ $ paneru send-cmd <command> [args...]
 | `quit`                     | Quit Paneru                                      |
 
 Where `<direction>` is one of: `west`, `east`, `north`, `south`, `first`, `last`.
+Numbered indexes are one-based, so `window focus 1` focuses the first strip column.
 
 #### Examples
 
@@ -255,6 +258,12 @@ $ paneru send-cmd window shrink
 
 # Jump to the left-most window.
 $ paneru send-cmd window focus first
+
+# Jump to the third strip column.
+$ paneru send-cmd window focus 3
+
+# Focus a visible window by macOS window id, e.g. from `paneru query virtual-workspaces`.
+$ paneru send-cmd window focusid 1781
 
 # Switch directly to virtual workspace 3.
 $ paneru send-cmd window virtualnum 3

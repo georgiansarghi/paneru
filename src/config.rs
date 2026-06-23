@@ -20,7 +20,7 @@ use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 use crate::{
     commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
-    platform::{Modifiers, OSStatus, macos_major_version},
+    platform::{Modifiers, OSStatus, WinID, macos_major_version},
 };
 use crate::{
     errors::{Error, Result},
@@ -143,20 +143,38 @@ fn parse_direction(dir: &str) -> Result<Direction> {
     })
 }
 
-fn parse_virtual_workspace_number(input: &str) -> Result<u32> {
+fn parse_one_based_index(input: &str, kind: &str) -> Result<u32> {
     let number = input.parse::<u32>().map_err(|_| {
-        Error::InvalidConfig(format!(
-            "{}: Unhandled virtual workspace {input}",
-            function_name!()
-        ))
+        Error::InvalidConfig(format!("{}: Unhandled {kind} {input}", function_name!()))
     })?;
     if number == 0 {
         return Err(Error::InvalidConfig(format!(
-            "{}: Virtual workspace numbers start at 1",
+            "{}: {kind} numbers start at 1",
             function_name!()
         )));
     }
     Ok(number - 1)
+}
+
+fn parse_virtual_workspace_number(input: &str) -> Result<u32> {
+    parse_one_based_index(input, "virtual workspace")
+}
+
+fn parse_window_focus_index(input: &str) -> Result<u32> {
+    parse_one_based_index(input, "window focus index")
+}
+
+fn parse_window_id(input: &str) -> Result<WinID> {
+    let window_id = input.parse::<WinID>().map_err(|_| {
+        Error::InvalidConfig(format!("{}: Unhandled window id {input}", function_name!()))
+    })?;
+    if window_id <= 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{}: Window ids must be positive",
+            function_name!()
+        )));
+    }
+    Ok(window_id)
 }
 
 /// Parses a string into a `ResizeDirection` enum.
@@ -193,8 +211,12 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "focus" => match *argv.get(1).ok_or(err.clone())? {
             "unmanaged" => Operation::FocusUnmanaged,
             "managed" => Operation::FocusManaged,
+            target if target.parse::<u32>().is_ok() => {
+                Operation::FocusIndex(parse_window_focus_index(target)?)
+            }
             dir => Operation::Focus(parse_direction(dir)?),
         },
+        "focusid" => Operation::FocusId(parse_window_id(argv.get(1).ok_or(err)?)?),
         "raise" => match *argv.get(1).ok_or(err.clone())? {
             "floating" => Operation::RaiseFloating,
             _ => return Err(err),
@@ -1759,6 +1781,24 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_parse_focus_target_commands() {
+    assert!(matches!(
+        parse_command(&["window", "focus", "east"]).unwrap(),
+        Command::Window(Operation::Focus(Direction::East))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "focus", "3"]).unwrap(),
+        Command::Window(Operation::FocusIndex(2))
+    ));
+    assert!(matches!(
+        parse_command(&["window", "focusid", "1781"]).unwrap(),
+        Command::Window(Operation::FocusId(1781))
+    ));
+    assert!(parse_command(&["window", "focus", "0"]).is_err());
+    assert!(parse_command(&["window", "focusid", "0"]).is_err());
 }
 
 #[test]
