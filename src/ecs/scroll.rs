@@ -11,7 +11,7 @@ use tracing::{Level, instrument};
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
-use crate::config::swipe::SwipeGestureDirection;
+use crate::config::swipe::{SwipeGestureDirection, SwipeGestureHorizontalAction};
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
@@ -35,6 +35,7 @@ impl Plugin for ScrollEventsPlugin {
             (
                 vertical_swipe_gesture.run_if(mission_control_inactive),
                 (
+                    horizontal_focus_gesture.run_if(mission_control_inactive),
                     swipe_gesture.run_if(mission_control_inactive),
                     apply_inertia,
                     apply_snap_force,
@@ -45,6 +46,94 @@ impl Plugin for ScrollEventsPlugin {
                     .chain(),
             ),
         );
+    }
+}
+
+#[derive(Default)]
+struct HorizontalGestureState {
+    accumulated: f64,
+    fingers_count: Option<usize>,
+    last_event: Option<Instant>,
+    fired: bool,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[instrument(level = Level::TRACE, skip_all)]
+fn horizontal_focus_gesture(
+    mut messages: MessageReader<Event>,
+    config: Res<Config>,
+    mut commands: Commands,
+    mut state: Local<HorizontalGestureState>,
+) {
+    let focus_column = |delta: f64, commands: &mut Commands| {
+        let physical_finger_direction = if delta > 0.0 {
+            Direction::East
+        } else {
+            Direction::West
+        };
+        let direction = match config.swipe_gesture_direction() {
+            SwipeGestureDirection::Natural => physical_finger_direction,
+            SwipeGestureDirection::Reversed => physical_finger_direction.reverse(),
+        };
+        commands.trigger(SendMessageTrigger(Event::Command {
+            command: Command::Window(Operation::Focus(direction)),
+        }));
+    };
+
+    const GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
+
+    // Reset state when the gesture times out (fingers lifted).
+    if let Some(last) = state.last_event
+        && last.elapsed() > GESTURE_TIMEOUT
+    {
+        state.accumulated = 0.0;
+        state.fired = false;
+    }
+
+    // Only fire once per physical trackpad gesture.
+    if state.fired {
+        for event in messages.read() {
+            if let Event::Swipe { .. } = event {
+                state.last_event = Some(Instant::now());
+            }
+        }
+        return;
+    }
+
+    for event in messages.read() {
+        match event {
+            Event::TouchpadDown => {
+                state.accumulated = 0.0;
+                state.fingers_count = None;
+                state.fired = false;
+                state.last_event = Some(Instant::now());
+            }
+            Event::Swipe { deltas }
+                if config.swipe_gesture_horizontal_action(deltas.len())
+                    == SwipeGestureHorizontalAction::Focus =>
+            {
+                if state.fingers_count != Some(deltas.len()) {
+                    state.accumulated = 0.0;
+                    state.fingers_count = Some(deltas.len());
+                }
+                state.accumulated += deltas.iter().sum::<f64>();
+                state.last_event = Some(Instant::now());
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(fingers_count) = state.fingers_count
+        && state.accumulated != 0.0
+    {
+        // Threshold is configurable per horizontal rule. Lower values are more
+        // sensitive and catch shorter swipes.
+        let threshold = config.swipe_gesture_horizontal_threshold(fingers_count);
+        if state.accumulated.abs() >= threshold {
+            focus_column(state.accumulated, &mut commands);
+            state.accumulated = 0.0;
+            state.fired = true;
+        }
     }
 }
 
@@ -86,9 +175,8 @@ fn swipe_gesture(
                 has_scroll_event = true;
             }
             Event::Swipe { deltas }
-                if config
-                    .swipe_gesture_fingers()
-                    .is_none_or(|fingers| deltas.len() == fingers) =>
+                if config.swipe_gesture_horizontal_action(deltas.len())
+                    == SwipeGestureHorizontalAction::Scroll =>
             {
                 total_delta += deltas.iter().sum::<f64>();
                 has_scroll_event = true;
@@ -425,7 +513,7 @@ fn vertical_swipe_gesture(
     if state.accumulated != 0.0 {
         // Threshold needs to be high enough that incidental vertical movement
         // during horizontal swipes doesn't trigger a workspace switch.
-        let threshold = 0.15 / config.swipe_sensitivity();
+        let threshold = config.swipe_gesture_threshold();
         if state.accumulated.abs() >= threshold {
             switch_virtual(state.accumulated, &mut commands);
             state.accumulated = 0.0;

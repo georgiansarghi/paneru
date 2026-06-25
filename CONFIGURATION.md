@@ -63,9 +63,19 @@ Configure trackpad gestures and scroll-wheel window sliding.
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
+| `fingers_count` | Integer | *None* | Legacy/default finger count for swipe gestures. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
+| `horizontal` | String or array of tables | `"Scroll"` | Horizontal gesture action. Shorthand values: `"Scroll"`, `"Focus"`, or `"Disabled"`. For multiple finger counts, use `[[swipe.gesture.horizontal]]` rules. |
+| `threshold` | Float | `0.15 / sensitivity` | Accumulated normalized delta required for one-shot gestures. Lower values are more sensitive. |
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
+
+### `[[swipe.gesture.horizontal]]`
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `fingers_count` | Integer | required | Number of fingers for this horizontal gesture rule. |
+| `action` | String | required | `"Scroll"` slides the strip, `"Focus"` focuses the previous/next column once per swipe, `"Disabled"` ignores/passes through the gesture. |
+| `sensitivity` | Float | `1.0` | Rule-specific multiplier for one-shot gesture sensitivity. Higher values require a shorter swipe. |
+| `threshold` | Float | `0.15 / ([swipe].sensitivity * sensitivity)` | Explicit accumulated normalized delta required to fire this rule. Lower values are more sensitive and override `sensitivity`. |
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |

@@ -176,9 +176,98 @@ fn test_scrolling() {
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -315, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 85, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 485, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -316, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 84, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 484, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_horizontal_swipe_can_focus_adjacent_column() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Swipe {
+            deltas: vec![0.05, 0.05, 0.05],
+        },
+    ];
+
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[swipe]
+sensitivity = 0.35
+
+[swipe.gesture]
+direction = "Natural"
+
+[[swipe.gesture.horizontal]]
+fingers_count = 3
+action = "focus"
+threshold = 0.08
+
+[[swipe.gesture.horizontal]]
+fingers_count = 4
+action = "scroll"
+"#,
+    )
+    .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_horizontal_swipe_can_route_different_finger_counts() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Swipe {
+            deltas: vec![0.1, 0.1, 0.1, 0.1],
+        },
+    ];
+
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[swipe]
+sensitivity = 0.35
+
+[swipe.gesture]
+direction = "Natural"
+
+[[swipe.gesture.horizontal]]
+fingers_count = 3
+action = "focus"
+threshold = 0.08
+
+[[swipe.gesture.horizontal]]
+fingers_count = 4
+action = "scroll"
+"#,
+    )
+    .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            let entity = find_window_entity(0, world);
+            let window = world.get::<Window>(entity).expect("finding window");
+            assert!(window.frame().min.x < 0);
         })
         .run(commands);
 }
