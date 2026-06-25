@@ -326,6 +326,7 @@ fn command_move_focus(
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -413,8 +414,11 @@ fn command_move_focus(
         commands.focus_entity(entity, true);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
-        // set, causing the WindowFocused handler to skip the reshuffle.
-        commands.reshuffle_around(entity);
+        // set, causing the WindowFocused handler to skip the reshuffle. When
+        // auto-center is enabled, the focus system moves the strip instead.
+        if !config.auto_center() {
+            commands.reshuffle_around(entity);
+        }
         return;
     }
 
@@ -439,6 +443,7 @@ fn command_move_focus(
 fn command_focus_index(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::FocusIndex(index)) =
@@ -457,7 +462,9 @@ fn command_focus_index(
     };
 
     commands.focus_entity(entity, true);
-    commands.reshuffle_around(entity);
+    if !config.auto_center() {
+        commands.reshuffle_around(entity);
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -466,6 +473,7 @@ fn command_focus_id(
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::FocusId(window_id)) =
@@ -493,7 +501,9 @@ fn command_focus_id(
     }
 
     commands.focus_entity(entity, true);
-    commands.reshuffle_around(entity);
+    if !config.auto_center() {
+        commands.reshuffle_around(entity);
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]

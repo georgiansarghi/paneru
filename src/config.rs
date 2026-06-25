@@ -17,7 +17,10 @@ use stdext::function_name;
 use tracing::{error, info, warn};
 
 use self::decorations::BorderRadiusOption;
-use self::swipe::SwipeGestureDirection;
+use self::swipe::{
+    SwipeGestureDirection, SwipeGestureHorizontalAction, SwipeGestureHorizontalConfig,
+    SwipeGestureHorizontalRule,
+};
 use crate::{
     commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
     manager::ProcessApi,
@@ -526,6 +529,64 @@ impl Config {
             .or(config.options.swipe_gesture_fingers)
     }
 
+    pub fn swipe_gesture_horizontal_action(
+        &self,
+        fingers_count: usize,
+    ) -> SwipeGestureHorizontalAction {
+        let config = self.inner();
+        let gesture = config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref());
+        let legacy_fingers = gesture
+            .and_then(|gesture| gesture.fingers_count)
+            .or(config.options.swipe_gesture_fingers);
+        let legacy_fingers_match = legacy_fingers.is_none_or(|fingers| fingers == fingers_count);
+
+        match gesture.and_then(|gesture| gesture.horizontal.as_ref()) {
+            Some(SwipeGestureHorizontalConfig::Action(action)) if legacy_fingers_match => {
+                action.clone()
+            }
+            Some(SwipeGestureHorizontalConfig::Action(_)) => SwipeGestureHorizontalAction::Disabled,
+            Some(SwipeGestureHorizontalConfig::Rules(rules)) => rules
+                .iter()
+                .find(|rule| rule.fingers_count == fingers_count)
+                .map_or(SwipeGestureHorizontalAction::Disabled, |rule| {
+                    rule.action.clone()
+                }),
+            None if legacy_fingers_match => SwipeGestureHorizontalAction::Scroll,
+            None => SwipeGestureHorizontalAction::Disabled,
+        }
+    }
+
+    pub fn swipe_gesture_threshold(&self) -> f64 {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.threshold)
+            .unwrap_or_else(|| 0.15 / self.swipe_sensitivity())
+            .clamp(0.001, 2.0)
+    }
+
+    pub fn swipe_gesture_horizontal_threshold(&self, fingers_count: usize) -> f64 {
+        let config = self.inner();
+        let gesture = config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref());
+        if let Some(SwipeGestureHorizontalConfig::Rules(rules)) =
+            gesture.and_then(|gesture| gesture.horizontal.as_ref())
+            && let Some(rule) = rules
+                .iter()
+                .find(|rule| rule.fingers_count == fingers_count)
+        {
+            return horizontal_rule_threshold(rule, self.swipe_sensitivity());
+        }
+        self.swipe_gesture_threshold()
+    }
+
     pub fn swipe_vertical(&self) -> bool {
         let config = self.inner();
         config
@@ -853,6 +914,15 @@ impl Config {
             .insert_windows_mid_strip
             .is_some_and(|enabled| enabled)
     }
+}
+
+fn horizontal_rule_threshold(rule: &SwipeGestureHorizontalRule, swipe_sensitivity: f64) -> f64 {
+    rule.threshold
+        .unwrap_or_else(|| {
+            let rule_sensitivity = rule.sensitivity.unwrap_or(1.0).clamp(0.1, 10.0);
+            0.15 / (swipe_sensitivity * rule_sensitivity)
+        })
+        .clamp(0.001, 2.0)
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {

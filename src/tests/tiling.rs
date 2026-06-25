@@ -164,6 +164,36 @@ fn test_startup_windows() {
 }
 
 #[test]
+fn test_auto_center_moves_strip_on_focus() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::FocusIndex(1)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let centered = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .on_iteration(1, move |world, _state| {
+            assert_window_at!(world, 0, centered - TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, centered, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, centered + TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
 fn test_window_resize_grow_and_shrink_cycle() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },

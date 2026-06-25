@@ -185,6 +185,97 @@ fn test_scrolling() {
 }
 
 #[test]
+fn test_horizontal_swipe_can_focus_adjacent_column() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Swipe {
+            delta: 0.15,
+            fingers: 3,
+        },
+    ];
+
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[swipe]
+sensitivity = 0.35
+
+[swipe.gesture]
+direction = "Natural"
+
+[[swipe.gesture.horizontal]]
+fingers_count = 3
+action = "focus"
+threshold = 0.08
+
+[[swipe.gesture.horizontal]]
+fingers_count = 4
+action = "scroll"
+"#,
+    )
+    .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_horizontal_swipe_can_route_different_finger_counts() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Swipe {
+            delta: 0.4,
+            fingers: 4,
+        },
+    ];
+
+    let config = Config::try_from(
+        r#"
+[options]
+
+[bindings]
+
+[swipe]
+sensitivity = 0.35
+
+[swipe.gesture]
+direction = "Natural"
+
+[[swipe.gesture.horizontal]]
+fingers_count = 3
+action = "focus"
+threshold = 0.08
+
+[[swipe.gesture.horizontal]]
+fingers_count = 4
+action = "scroll"
+"#,
+    )
+    .expect("config should parse");
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            let entity = find_window_entity(0, world);
+            let window = world.get::<Window>(entity).expect("finding window");
+            assert!(window.frame().min.x < 0);
+        })
+        .run(commands);
+}
+
+#[test]
 #[allow(clippy::float_cmp)]
 fn test_scrolling_stop() {
     let commands = vec![

@@ -285,7 +285,10 @@ pub(super) fn window_focused_trigger(
         }
 
         if already_focused {
-            if !global_state.skip_reshuffle() && !global_state.initializing() {
+            if !global_state.skip_reshuffle()
+                && !global_state.initializing()
+                && !config.auto_center()
+            {
                 commands.reshuffle_around(entity);
             }
             continue;

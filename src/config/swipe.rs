@@ -8,6 +8,42 @@ pub enum SwipeGestureDirection {
     Reversed,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub enum SwipeGestureHorizontalAction {
+    #[serde(alias = "scroll")]
+    Scroll,
+    #[serde(alias = "focus")]
+    Focus,
+    #[serde(alias = "disabled")]
+    Disabled,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum SwipeGestureHorizontalConfig {
+    /// Backward-compatible shorthand: `horizontal = "scroll"` or `"focus"`.
+    Action(SwipeGestureHorizontalAction),
+    /// Per-finger-count routing: `[[swipe.gesture.horizontal]]` tables.
+    Rules(Vec<SwipeGestureHorizontalRule>),
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct SwipeGestureHorizontalRule {
+    /// Number of fingers that should trigger this horizontal gesture rule.
+    pub fingers_count: usize,
+
+    /// Action to perform for this finger count.
+    pub action: SwipeGestureHorizontalAction,
+
+    /// Gesture-specific sensitivity multiplier. Higher values require a
+    /// shorter swipe. Multiplies `[swipe].sensitivity` for threshold checks.
+    pub sensitivity: Option<f64>,
+
+    /// Explicit accumulated normalized delta required to fire the gesture.
+    /// Lower values are more sensitive. Overrides `sensitivity` when set.
+    pub threshold: Option<f64>,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct SwipeOptions {
     /// Swipe sensitivity multiplier. Lower values = less distance per finger
@@ -34,6 +70,13 @@ pub struct GestureOptions {
 
     /// Which direction swipe gestures should move windows.
     pub direction: Option<SwipeGestureDirection>,
+
+    /// How horizontal swipe gestures should behave.
+    pub horizontal: Option<SwipeGestureHorizontalConfig>,
+
+    /// Explicit accumulated normalized delta required to fire one-shot
+    /// gestures. Lower values are more sensitive.
+    pub threshold: Option<f64>,
 
     /// Whether to intercept vertical swipes.
     pub vertical: Option<bool>,
