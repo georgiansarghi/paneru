@@ -1,4 +1,5 @@
 /target
+/perf-runs
 
 # Outputs from `nix build`
 /result

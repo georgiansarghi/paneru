@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use super::{Command, Operation};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::Windows;
-use crate::ecs::state::{PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState};
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker};
+use crate::ecs::state::{
+    PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, StateQueryKind,
+};
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, LoopDiagnostics};
 use crate::events::Event;
 use crate::manager::{Application, Display};
 use crate::platform::WinID;
@@ -178,16 +180,23 @@ fn state_query_handler(
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
+    diagnostics: Option<Res<LoopDiagnostics>>,
 ) {
     for event in messages.read() {
         let Event::StateQuery { kind, respond_to } = event else {
             continue;
         };
 
-        let state = PaneruQueryState::extract(&workspaces, &displays, &windows, &apps);
-        let response = state
-            .to_query_json(*kind)
-            .unwrap_or_else(|err| json!({ "error": err.to_string() }).to_string());
+        let response = if matches!(kind, StateQueryKind::RuntimeDiagnostics) {
+            diagnostics.as_deref().map_or_else(
+                || serde_json::to_string(&LoopDiagnostics::default()),
+                serde_json::to_string,
+            )
+        } else {
+            let state = PaneruQueryState::extract(&workspaces, &displays, &windows, &apps);
+            state.to_query_json(*kind)
+        }
+        .unwrap_or_else(|err| json!({ "error": err.to_string() }).to_string());
         _ = respond_to.send(response);
     }
 }
