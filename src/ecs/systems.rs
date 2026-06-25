@@ -5,14 +5,15 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
-    Commands, Local, NonSend, NonSendMut, ParallelCommands, Populated, Query, Res, ResMut, Single,
+    Commands, Local, NonSend, NonSendMut, ParallelCommands, ParamSet, Populated, Query, Res,
+    ResMut, Single,
 };
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -27,9 +28,9 @@ use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, Initializing, LowPowerMode,
-    MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
+    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::Event;
 use crate::manager::{
@@ -1145,4 +1146,385 @@ pub(crate) fn detect_tabbed_windows(
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct TabReconcileCandidate {
+    entity: Entity,
+    app_entity: Entity,
+    window_id: WinID,
+    frame: IRect,
+    focused: bool,
+    on_screen: bool,
+    strip_order: usize,
+}
+
+/// Reconciles native tab groups that were missed during the creation-time race.
+///
+/// Some apps expose each native tab as an AX window while only the selected tab
+/// has a real CG on-screen window. The creation-time detector can miss that if
+/// `CGWindowList` still reports the previous tab as on-screen. This pass is a
+/// deliberately conservative second chance: it only groups same-app windows in
+/// the active strip when their current frames overlap and exactly one of them is
+/// on-screen.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
+pub(crate) fn reconcile_tabbed_windows(
+    windows: Query<(Entity, &Window, &ChildOf, Has<FocusedMarker>), With<Window>>,
+    mut workspaces: ParamSet<(
+        Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+        Query<&mut LayoutStrip>,
+    )>,
+    mut apps: Query<&mut Application>,
+    window_manager: Res<WindowManager>,
+    mut stale_tab_candidates: Local<HashMap<Entity, u8>>,
+    mut visible_tab_groups: Local<HashMap<Vec<Entity>, u8>>,
+    mut commands: Commands,
+) {
+    let Some(on_screen_ids) = window_manager.windows_on_screen() else {
+        return;
+    };
+    let on_screen_ids = on_screen_ids.into_iter().collect::<HashSet<_>>();
+
+    let (active_strip_entity, reconciliations, stale_entities, missing_windows, split_groups) = {
+        let query = workspaces.p0();
+        let mut active_strip = None;
+        let mut all_candidates = Vec::new();
+        let mut strip_tab_groups = Vec::new();
+
+        for (strip_entity, strip, active) in &query {
+            if active {
+                active_strip = Some((strip_entity, strip));
+            }
+            let mut tab_seen = HashSet::new();
+            let tab_groups = strip
+                .all_windows()
+                .into_iter()
+                .filter_map(|entity| {
+                    if tab_seen.contains(&entity) {
+                        return None;
+                    }
+                    let entities = strip.tab_group(entity)?;
+                    tab_seen.extend(entities.iter().copied());
+                    let index = entities
+                        .iter()
+                        .filter_map(|entity| strip.index_of(*entity).ok())
+                        .min()
+                        .unwrap_or_else(|| strip.len());
+                    Some((index, entities))
+                })
+                .collect::<Vec<_>>();
+            if !tab_groups.is_empty() {
+                strip_tab_groups.push((strip_entity, tab_groups));
+            }
+            all_candidates.extend(strip.all_windows().into_iter().enumerate().filter_map(
+                |(strip_order, entity)| {
+                    let (entity, window, child, focused) = windows.get(entity).ok()?;
+                    Some((
+                        strip_entity,
+                        TabReconcileCandidate {
+                            entity,
+                            app_entity: child.parent(),
+                            window_id: window.id(),
+                            frame: window.frame(),
+                            focused,
+                            on_screen: on_screen_ids.contains(&window.id()),
+                            strip_order,
+                        },
+                    ))
+                },
+            ));
+        }
+
+        let Some((active_strip_entity, active_strip)) = active_strip else {
+            return;
+        };
+
+        let mut live_ids_by_app: HashMap<Entity, HashSet<WinID>> = HashMap::new();
+        let mut focused_id_by_app: HashMap<Entity, Option<WinID>> = HashMap::new();
+        let mut stale_entities = Vec::new();
+        let mut seen_entities = HashSet::new();
+        for (strip_entity, candidate) in &all_candidates {
+            seen_entities.insert(candidate.entity);
+            if candidate.focused || candidate.on_screen || cfg!(test) {
+                stale_tab_candidates.remove(&candidate.entity);
+                continue;
+            }
+
+            let has_live_tab_sibling_in_strip =
+                all_candidates.iter().any(|(other_strip, other)| {
+                    *other_strip == *strip_entity
+                        && other.entity != candidate.entity
+                        && other.app_entity == candidate.app_entity
+                        && other.on_screen
+                        && frames_match(candidate.frame, other.frame)
+                });
+            if has_live_tab_sibling_in_strip {
+                stale_tab_candidates.remove(&candidate.entity);
+                continue;
+            }
+
+            let has_live_same_app_window = all_candidates.iter().any(|(_, other)| {
+                other.entity != candidate.entity
+                    && other.app_entity == candidate.app_entity
+                    && other.on_screen
+            });
+            if !has_live_same_app_window {
+                stale_tab_candidates.remove(&candidate.entity);
+                continue;
+            }
+
+            let focused_id = *focused_id_by_app
+                .entry(candidate.app_entity)
+                .or_insert_with(|| {
+                    apps.get(candidate.app_entity)
+                        .ok()
+                        .and_then(|app| app.focused_window_id().ok())
+                });
+            let live_ids = live_ids_by_app
+                .entry(candidate.app_entity)
+                .or_insert_with(|| {
+                    apps.get(candidate.app_entity)
+                        .map(|app| {
+                            app.window_list()
+                                .into_iter()
+                                .map(|window| window.id())
+                                .collect::<HashSet<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+
+            if focused_id == Some(candidate.window_id)
+                || live_ids.is_empty()
+                || live_ids.contains(&candidate.window_id)
+            {
+                stale_tab_candidates.remove(&candidate.entity);
+                continue;
+            }
+
+            let count = stale_tab_candidates
+                .entry(candidate.entity)
+                .and_modify(|count| *count = (*count + 1).min(3))
+                .or_insert(1);
+            if *count >= 2 {
+                stale_entities.push((
+                    *strip_entity,
+                    candidate.entity,
+                    candidate.window_id,
+                    candidate.app_entity,
+                    candidate.focused,
+                ));
+            }
+        }
+        stale_tab_candidates.retain(|entity, _| seen_entities.contains(entity));
+
+        let mut missing_windows = Vec::new();
+        if !cfg!(test) {
+            let represented_ids = all_candidates
+                .iter()
+                .map(|(_, candidate)| candidate.window_id)
+                .collect::<HashSet<_>>();
+            let app_entities = all_candidates
+                .iter()
+                .map(|(_, candidate)| candidate.app_entity)
+                .collect::<HashSet<_>>();
+            for app_entity in app_entities {
+                let focused_id = *focused_id_by_app.entry(app_entity).or_insert_with(|| {
+                    apps.get(app_entity)
+                        .ok()
+                        .and_then(|app| app.focused_window_id().ok())
+                });
+                if let Ok(app) = apps.get(app_entity) {
+                    missing_windows.extend(app.window_list().into_iter().filter(|window| {
+                        !represented_ids.contains(&window.id())
+                            && (on_screen_ids.contains(&window.id())
+                                || focused_id == Some(window.id()))
+                    }));
+                }
+            }
+        }
+
+        let candidates = all_candidates
+            .iter()
+            .filter_map(|(strip_entity, candidate)| {
+                (*strip_entity == active_strip_entity).then_some(*candidate)
+            })
+            .collect::<Vec<_>>();
+        let candidates_by_entity = all_candidates
+            .iter()
+            .map(|(_, candidate)| (candidate.entity, *candidate))
+            .collect::<HashMap<_, _>>();
+
+        let mut split_groups = Vec::new();
+        let mut visible_tab_group_keys = HashSet::new();
+        for (strip_entity, tab_groups) in strip_tab_groups {
+            for (index, entities) in tab_groups {
+                let group = entities
+                    .iter()
+                    .filter_map(|entity| candidates_by_entity.get(entity).copied())
+                    .collect::<Vec<_>>();
+                if group.len() != entities.len() {
+                    continue;
+                }
+                let on_screen_count = group.iter().filter(|candidate| candidate.on_screen).count();
+                if on_screen_count <= 1 {
+                    continue;
+                }
+
+                let key = entities.clone();
+                visible_tab_group_keys.insert(key.clone());
+                let count = visible_tab_groups
+                    .entry(key)
+                    .and_modify(|count| *count = (*count + 1).min(3))
+                    .or_insert(1);
+                if *count >= 2 {
+                    let window_ids = group
+                        .iter()
+                        .map(|candidate| candidate.window_id)
+                        .collect::<Vec<_>>();
+                    split_groups.push((strip_entity, index, entities, window_ids));
+                }
+            }
+        }
+        visible_tab_groups.retain(|key, _| visible_tab_group_keys.contains(key));
+
+        let mut grouped = HashSet::new();
+        let mut reconciliations = Vec::new();
+        for candidate in &candidates {
+            if grouped.contains(&candidate.entity) {
+                continue;
+            }
+
+            let mut group = candidates
+                .iter()
+                .copied()
+                .filter(|other| {
+                    other.entity != candidate.entity
+                        && !grouped.contains(&other.entity)
+                        && other.app_entity == candidate.app_entity
+                        && frames_match(candidate.frame, other.frame)
+                })
+                .chain(std::iter::once(*candidate))
+                .collect::<Vec<_>>();
+
+            if group.len() < 2 {
+                continue;
+            }
+
+            let on_screen_count = group.iter().filter(|candidate| candidate.on_screen).count();
+            if on_screen_count != 1 {
+                continue;
+            }
+
+            group.sort_by_key(|candidate| candidate.strip_order);
+            let entities = ordered_tab_group(&group);
+            if active_strip.tab_group(entities[0]).as_deref() == Some(entities.as_slice()) {
+                grouped.extend(entities);
+                continue;
+            }
+
+            let index = group
+                .iter()
+                .filter_map(|candidate| active_strip.index_of(candidate.entity).ok())
+                .min()
+                .unwrap_or_else(|| active_strip.len());
+            let window_ids = group
+                .iter()
+                .map(|candidate| candidate.window_id)
+                .collect::<Vec<_>>();
+            reconciliations.push((index, entities.clone(), window_ids));
+            grouped.extend(entities);
+        }
+
+        (
+            active_strip_entity,
+            reconciliations,
+            stale_entities,
+            missing_windows,
+            split_groups,
+        )
+    };
+
+    if !missing_windows.is_empty() {
+        let window_ids = missing_windows
+            .iter()
+            .map(|window| window.id())
+            .collect::<Vec<_>>();
+        info!("Recovering missing live native-tab window(s): {window_ids:?}");
+        commands.trigger(SpawnWindowTrigger(missing_windows));
+    }
+
+    if reconciliations.is_empty() && stale_entities.is_empty() && split_groups.is_empty() {
+        return;
+    }
+
+    let mut query = workspaces.p1();
+    for (strip_entity, entity, window_id, app_entity, focused) in stale_entities {
+        info!(
+            "Removing stale native-tab candidate window {window_id} entity {entity} focused={focused}"
+        );
+        if let Ok(mut strip) = query.get_mut(strip_entity)
+            && strip.contains(entity)
+        {
+            strip.remove(entity);
+        }
+        if let Ok((_, window, _, _)) = windows.get(entity)
+            && let Ok(mut app) = apps.get_mut(app_entity)
+        {
+            app.unobserve_window(window);
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_despawn();
+        }
+        stale_tab_candidates.remove(&entity);
+    }
+
+    if split_groups.is_empty() && reconciliations.is_empty() {
+        return;
+    }
+
+    for (strip_entity, index, entities, window_ids) in split_groups {
+        info!("Splitting visible native-tab group back into windows: {window_ids:?}");
+        if let Ok(mut strip) = query.get_mut(strip_entity) {
+            for entity in &entities {
+                strip.remove(*entity);
+            }
+            for (offset, entity) in entities.into_iter().enumerate() {
+                strip.insert_at(index + offset, entity);
+            }
+        }
+    }
+
+    if reconciliations.is_empty() {
+        return;
+    }
+    let Ok(mut strip) = query.get_mut(active_strip_entity) else {
+        return;
+    };
+    for (index, entities, window_ids) in reconciliations {
+        debug!("Reconciling native tab group: {window_ids:?}");
+        strip.insert_tab_group_at(index, &entities);
+    }
+}
+
+fn frames_match(lhs: IRect, rhs: IRect) -> bool {
+    lhs.min.chebyshev_distance(rhs.min) <= 1 && lhs.size().chebyshev_distance(rhs.size()) <= 1
+}
+
+fn ordered_tab_group(group: &[TabReconcileCandidate]) -> Vec<Entity> {
+    let mut ordered = group.to_vec();
+    ordered.sort_by_key(|candidate| {
+        (
+            !candidate.on_screen,
+            !candidate.focused,
+            candidate.strip_order,
+        )
+    });
+    ordered
+        .into_iter()
+        .map(|candidate| candidate.entity)
+        .collect()
 }

@@ -160,7 +160,15 @@ fn autocenter_window_on_focus(
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
     }
-    if active_display.active_strip().tabbed(entity) {
+    if active_display.active_strip().tabbed(entity)
+        && windows.frame(entity).is_some_and(|frame| {
+            let bounds = active_display.bounds();
+            frame.min.x >= bounds.min.x
+                && frame.min.y >= bounds.min.y
+                && frame.max.x <= bounds.max.x
+                && frame.max.y <= bounds.max.y
+        })
+    {
         return;
     }
     if config.auto_center()

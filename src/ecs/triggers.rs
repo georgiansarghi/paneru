@@ -435,6 +435,7 @@ pub(super) fn dispatch_application_messages(
         match event {
             Event::WindowMinimized { window_id } => {
                 if let Some((_, entity)) = find_window(*window_id) {
+                    info!("WindowMinimized event: window {window_id} entity {entity}");
                     commands.entity(entity).try_insert(Unmanaged::Minimized);
                 }
             }
@@ -444,6 +445,7 @@ pub(super) fn dispatch_application_messages(
                     && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
+                    info!("WindowDeminimized event: window {window_id} entity {entity}");
                     entity_commands.try_remove::<Unmanaged>();
                 }
             }
@@ -454,10 +456,15 @@ pub(super) fn dispatch_application_messages(
                     warn!("Unable to find with pid {pid}");
                     continue;
                 };
+                info!(
+                    "ApplicationHidden event: pid {pid}, children={}",
+                    children.len()
+                );
                 for entity in children {
                     // Only hide windows that are currently managed (no Unmanaged component).
                     // Preserve existing Floating, Minimized, and Hidden states.
                     if unmanaged_query.get(*entity).is_err() {
+                        info!("marking entity {entity} hidden for pid {pid}");
                         commands.entity(*entity).try_insert(Unmanaged::Hidden);
                     }
                 }
@@ -469,12 +476,17 @@ pub(super) fn dispatch_application_messages(
                     warn!("Unable to find application with pid {pid}");
                     continue;
                 };
+                info!(
+                    "ApplicationVisible event: pid {pid}, children={}",
+                    children.len()
+                );
                 for entity in children {
                     // Only restore windows that were hidden by the app hide/show cycle.
                     // Preserve Floating and Minimized states.
                     if matches!(unmanaged_query.get(*entity), Ok(Unmanaged::Hidden))
                         && let Ok(mut entity_commands) = commands.get_entity(*entity)
                     {
+                        info!("removing hidden marker from entity {entity} for pid {pid}");
                         entity_commands.try_remove::<Unmanaged>();
                     }
                 }
@@ -616,10 +628,23 @@ pub(super) fn window_minimized_trigger(
         debug!("Entity {entity} is minimized or hidden.");
         let display_bounds = active_display.bounds();
 
+        let parent = windows
+            .get(entity)
+            .and_then(|window| windows.find_parent(window.id()))
+            .map(|(_, _, parent)| parent);
         for (mut strip, active) in workspaces {
-            if active {
+            if active && let Some(parent) = parent {
+                info!(
+                    "Unmanaged {:?}: giving away focus from entity {entity}; active strip {} len {}",
+                    windows
+                        .get_managed(entity)
+                        .and_then(|(_, _, unmanaged)| unmanaged),
+                    strip.id(),
+                    strip.len()
+                );
                 give_away_focus(
                     entity,
+                    parent,
                     &windows,
                     &strip,
                     &display_bounds,
@@ -629,6 +654,16 @@ pub(super) fn window_minimized_trigger(
             }
             if strip.contains(entity) {
                 if let Ok(index) = strip.index_of(entity) {
+                    info!(
+                        "Unmanaged {:?}: removing entity {entity} from strip {} virtual {} index {} len {}",
+                        windows
+                            .get_managed(entity)
+                            .and_then(|(_, _, unmanaged)| unmanaged),
+                        strip.id(),
+                        strip.virtual_index,
+                        index,
+                        strip.len()
+                    );
                     commands.entity(entity).try_insert(PreviousManagedStrip {
                         workspace_id: strip.id(),
                         virtual_index: strip.virtual_index,
@@ -769,13 +804,18 @@ pub(super) fn window_destroyed_trigger(
         };
 
         let Some((window, entity, parent)) = windows.find_parent(*window_id) else {
+            info!("WindowDestroyed event: window {window_id} already absent");
             debug!("Duplicate event: window {window_id} already destroyed.");
             continue;
         };
         if window.role().is_ok() {
+            info!(
+                "WindowDestroyed event: window {window_id} entity {entity} still has AX role; treating as workspace change"
+            );
             debug!("Window still present, this was SLS workspace change.");
             continue;
         }
+        info!("WindowDestroyed event: destroying window {window_id} entity {entity}");
 
         let Ok(mut app) = apps.get_mut(parent) else {
             error!("Window {} has no parent!", window.id());
@@ -785,6 +825,7 @@ pub(super) fn window_destroyed_trigger(
 
         give_away_focus(
             entity,
+            parent,
             &windows,
             active_display.active_strip(),
             &active_display.bounds(),
@@ -804,6 +845,7 @@ pub(super) fn window_destroyed_trigger(
 /// Moves the focus away to a neighbour window.
 fn give_away_focus(
     entity: Entity,
+    parent: Entity,
     windows: &Windows,
     active_strip: &LayoutStrip,
     viewport: &IRect,
@@ -815,28 +857,27 @@ fn give_away_focus(
         // Remaining tab gets the focus.
         return;
     }
-    let display_center = viewport.center().x;
-    let closest = active_strip
-        .all_columns()
-        .into_iter()
-        .filter(|&candidate| candidate != entity)
-        .filter_map(|candidate| {
-            let center = windows.moving_frame(candidate)?.center().x;
-            let distance = (center - display_center).abs();
-            Some((candidate, distance))
-        })
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(e, _)| e)
-        .or_else(|| {
-            // Fallback when no candidate has a usable frame: pick any other
-            // column in the strip. Without this, losing focus on the only
-            // geometrically-known window would leave FocusedMarker unset and
-            // silently break keybindings.
-            active_strip
-                .all_columns()
-                .into_iter()
-                .find(|&candidate| candidate != entity)
+
+    // If native tab detection missed a tabbed app, its tabs can temporarily look
+    // like separate columns. Prefer another same-app window with the same frame
+    // (the likely native-tab sibling) before falling back to any same-app
+    // window, then the generic centered fallback. Otherwise closing one tab can
+    // jump to an unrelated app or a different window of the same app.
+    let destroyed_frame = windows.moving_frame(entity);
+    let same_app_same_frame =
+        closest_focus_candidate(entity, active_strip, viewport, windows, |candidate| {
+            same_parent(candidate, parent, windows)
+                && destroyed_frame
+                    .zip(windows.moving_frame(candidate))
+                    .is_some_and(|(destroyed, candidate)| frames_match(destroyed, candidate))
         });
+    let same_app = same_app_same_frame.or_else(|| {
+        closest_focus_candidate(entity, active_strip, viewport, windows, |candidate| {
+            same_parent(candidate, parent, windows)
+        })
+    });
+    let closest = same_app
+        .or_else(|| closest_focus_candidate(entity, active_strip, viewport, windows, |_| true));
 
     if let Some(neighbour) = closest
         && windows.get(neighbour).is_some()
@@ -849,6 +890,48 @@ fn give_away_focus(
         // AX API to raise the neighbour and inserts FocusedMarker directly.
         commands.focus_entity(neighbour, true);
     }
+}
+
+fn same_parent(entity: Entity, parent: Entity, windows: &Windows) -> bool {
+    windows
+        .get(entity)
+        .and_then(|window| windows.find_parent(window.id()))
+        .is_some_and(|(_, _, candidate_parent)| candidate_parent == parent)
+}
+
+fn frames_match(lhs: IRect, rhs: IRect) -> bool {
+    lhs.min.chebyshev_distance(rhs.min) <= 1 && lhs.size().chebyshev_distance(rhs.size()) <= 1
+}
+
+fn closest_focus_candidate(
+    entity: Entity,
+    active_strip: &LayoutStrip,
+    viewport: &IRect,
+    windows: &Windows,
+    mut predicate: impl FnMut(Entity) -> bool,
+) -> Option<Entity> {
+    let display_center = viewport.center().x;
+    active_strip
+        .all_columns()
+        .into_iter()
+        .filter(|&candidate| candidate != entity && predicate(candidate))
+        .filter_map(|candidate| {
+            let center = windows.moving_frame(candidate)?.center().x;
+            let distance = (center - display_center).abs();
+            Some((candidate, distance))
+        })
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(e, _)| e)
+        .or_else(|| {
+            // Fallback when no candidate has a usable frame: pick any other
+            // matching column in the strip. Without this, losing focus on the
+            // only geometrically-known window would leave FocusedMarker unset
+            // and silently break keybindings.
+            active_strip
+                .all_columns()
+                .into_iter()
+                .find(|&candidate| candidate != entity && predicate(candidate))
+        })
 }
 
 /// Handles the event when a new window is created. It adds the window to the manager and sets focus.
