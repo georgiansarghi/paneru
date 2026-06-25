@@ -1,10 +1,12 @@
 use bevy::ecs::message::Message;
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFRetained, CGPoint};
+use objc2_core_foundation::{CFRetained, CFRunLoop, CGPoint};
 use objc2_core_graphics::CGDirectDisplayID;
+use std::fmt;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::commands::Command;
 use crate::config::Config;
@@ -161,26 +163,103 @@ pub enum Event {
     StateSubscribe { stream: Arc<Mutex<UnixStream>> },
 }
 
-/// `EventSender` is a thin wrapper around a `std::sync::mpsc::Sender` for `Event`s.
-/// It provides a convenient way to send events to the main event loop from various parts of the application.
-#[derive(Clone, Debug)]
+trait EventWaker: Send + Sync {
+    fn wake(&self);
+}
+
+struct MainRunLoopWaker {
+    run_loop: usize,
+}
+
+// `CFRunLoopWakeUp` is explicitly safe to call from a different thread than the
+// target run loop. We only store the main run loop pointer, which is owned by
+// the process for its lifetime.
+unsafe impl Send for MainRunLoopWaker {}
+unsafe impl Sync for MainRunLoopWaker {}
+
+impl MainRunLoopWaker {
+    fn new() -> Option<Self> {
+        CFRunLoop::main().map(|run_loop| Self {
+            run_loop: CFRetained::as_ptr(&run_loop).as_ptr() as usize,
+        })
+    }
+}
+
+impl EventWaker for MainRunLoopWaker {
+    fn wake(&self) {
+        let run_loop = self.run_loop as *const CFRunLoop;
+        if let Some(run_loop) = unsafe { run_loop.as_ref() } {
+            run_loop.wake_up();
+        }
+    }
+}
+
+#[derive(Default)]
+struct NoopWaker;
+
+impl EventWaker for NoopWaker {
+    fn wake(&self) {}
+}
+
+/// Wakeable receive side for Paneru's internal event queue.
+///
+/// Every successful [`EventSender::send`] signals the main Cocoa run loop after
+/// the event is queued, so longer idle sleeps cannot strand commands, queries,
+/// or macOS callback events until a polling timeout expires.
+pub struct WakeableEventQueue {
+    rx: Receiver<Event>,
+}
+
+impl WakeableEventQueue {
+    pub fn recv(&self) -> std::result::Result<Event, std::sync::mpsc::RecvError> {
+        self.rx.recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Event, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+}
+
+/// `EventSender` is a wakeable wrapper around a `std::sync::mpsc::Sender` for
+/// `Event`s. It provides a convenient way to send events to the main event loop
+/// from various parts of the application.
+#[derive(Clone)]
 pub struct EventSender {
     tx: Sender<Event>,
+    waker: Arc<dyn EventWaker>,
+}
+
+impl fmt::Debug for EventSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventSender").finish_non_exhaustive()
+    }
 }
 
 impl EventSender {
-    /// Creates a new `EventSender` and its corresponding `Receiver`.
-    /// This function initializes an MPSC channel.
+    /// Creates a new `EventSender` and its corresponding wakeable receiver.
+    /// This function initializes an MPSC channel and captures the main Cocoa run
+    /// loop as the wake target when available.
     ///
     /// # Returns
     ///
-    /// A tuple containing the `EventSender` and `Receiver` for the created channel.
-    pub fn new() -> (Self, Receiver<Event>) {
-        let (tx, rx) = channel::<Event>();
-        (Self { tx }, rx)
+    /// A tuple containing the `EventSender` and receiver for the created queue.
+    pub fn new() -> (Self, WakeableEventQueue) {
+        let waker: Arc<dyn EventWaker> = MainRunLoopWaker::new().map_or_else(
+            || Arc::new(NoopWaker) as Arc<dyn EventWaker>,
+            |waker| Arc::new(waker) as Arc<dyn EventWaker>,
+        );
+        Self::new_with_waker(waker)
     }
 
-    /// Sends an `Event` through the internal channel.
+    fn new_with_waker(waker: Arc<dyn EventWaker>) -> (Self, WakeableEventQueue) {
+        let (tx, rx) = channel::<Event>();
+        (Self { tx, waker }, WakeableEventQueue { rx })
+    }
+
+    /// Sends an `Event` through the internal channel and wakes the main loop.
+    ///
+    /// The event is queued before the wake signal is sent. If the receiver has
+    /// already shut down, the send error is returned and no wake is attempted.
     ///
     /// # Arguments
     ///
@@ -190,6 +269,86 @@ impl EventSender {
     ///
     /// `Ok(())` if the event is sent successfully, otherwise `Err(Error)` if the receiver has disconnected.
     pub fn send(&self, event: Event) -> Result<()> {
-        Ok(self.tx.send(event)?)
+        self.tx.send(event)?;
+        self.waker.wake();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    #[derive(Default)]
+    struct CountingWaker {
+        count: AtomicUsize,
+    }
+
+    impl EventWaker for CountingWaker {
+        fn wake(&self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn send_queues_event_before_waking() {
+        let waker = Arc::new(CountingWaker::default());
+        let (sender, receiver) = EventSender::new_with_waker(waker.clone());
+
+        sender.send(Event::ProcessesLoaded).unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(1)).unwrap(),
+            Event::ProcessesLoaded
+        ));
+        assert_eq!(waker.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_from_background_thread_wakes_main_loop() {
+        let waker = Arc::new(CountingWaker::default());
+        let (sender, receiver) = EventSender::new_with_waker(waker.clone());
+        let sender = sender.clone();
+
+        thread::spawn(move || sender.send(Event::ProcessesLoaded))
+            .join()
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(1)).unwrap(),
+            Event::ProcessesLoaded
+        ));
+        assert_eq!(waker.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disconnected_receiver_returns_error_without_waking() {
+        let waker = Arc::new(CountingWaker::default());
+        let (sender, receiver) = EventSender::new_with_waker(waker.clone());
+        drop(receiver);
+
+        assert!(sender.send(Event::ProcessesLoaded).is_err());
+        assert_eq!(waker.count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn burst_sends_do_not_drop_events() {
+        let waker = Arc::new(CountingWaker::default());
+        let (sender, receiver) = EventSender::new_with_waker(waker.clone());
+
+        for _ in 0..128 {
+            sender.send(Event::ProcessesLoaded).unwrap();
+        }
+
+        for _ in 0..128 {
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_millis(1)).unwrap(),
+                Event::ProcessesLoaded
+            ));
+        }
+        assert_eq!(waker.count.load(Ordering::SeqCst), 128);
     }
 }

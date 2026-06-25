@@ -99,6 +99,7 @@ pub enum StateQueryKind {
     State,
     VirtualWorkspaces,
     Active,
+    RuntimeDiagnostics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -530,7 +531,9 @@ impl PaneruQueryState {
 
     pub fn to_query_json(&self, kind: StateQueryKind) -> serde_json::Result<String> {
         match kind {
-            StateQueryKind::State => serde_json::to_string(self),
+            StateQueryKind::State | StateQueryKind::RuntimeDiagnostics => {
+                serde_json::to_string(self)
+            }
             StateQueryKind::VirtualWorkspaces => serde_json::to_string(&self.virtual_workspaces),
             StateQueryKind::Active => serde_json::to_string(&self.active),
         }

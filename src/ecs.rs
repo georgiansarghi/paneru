@@ -1,5 +1,6 @@
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+
+use serde::Serialize;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
@@ -29,7 +30,7 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
-use crate::events::{Event, EventSender};
+use crate::events::{Event, EventSender, WakeableEventQueue};
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
@@ -130,6 +131,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
+            systems::record_periodic_maintenance.run_if(on_timer(Duration::from_secs(300))),
             state::periodic_state_save.run_if(on_timer(Duration::from_secs(300))),
             state::cleanup_on_exit,
         ),
@@ -410,6 +412,74 @@ impl VerifyWindowPosition {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LoopActivity {
+    pub repositioning: bool,
+    pub resizing: bool,
+    pub scrolling: bool,
+    pub flash_message: bool,
+    pub low_power: bool,
+}
+
+impl LoopActivity {
+    pub(crate) const fn frame_active(self) -> bool {
+        self.repositioning || self.resizing || self.scrolling || self.flash_message
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoopWakeReason {
+    CocoaEventPump,
+    InternalEvent,
+    TimeoutWatchdog,
+    FrameActive,
+    FlashMessageActive,
+    PeriodicMaintenance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LoopWakeCounters {
+    pub cocoa_event_pump: u64,
+    pub internal_event: u64,
+    pub timeout_watchdog: u64,
+    pub frame_active: u64,
+    pub flash_message_active: u64,
+    pub periodic_maintenance: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Resource, Serialize)]
+pub(crate) struct LoopDiagnostics {
+    pub counters: LoopWakeCounters,
+    pub last_activity: LoopActivity,
+    pub last_timeout_ms: u32,
+    pub last_timeout_limit_ms: u32,
+}
+
+impl LoopDiagnostics {
+    pub(crate) fn record(&mut self, reason: LoopWakeReason) {
+        match reason {
+            LoopWakeReason::CocoaEventPump => self.counters.cocoa_event_pump += 1,
+            LoopWakeReason::InternalEvent => self.counters.internal_event += 1,
+            LoopWakeReason::TimeoutWatchdog => self.counters.timeout_watchdog += 1,
+            LoopWakeReason::FrameActive => self.counters.frame_active += 1,
+            LoopWakeReason::FlashMessageActive => self.counters.flash_message_active += 1,
+            LoopWakeReason::PeriodicMaintenance => self.counters.periodic_maintenance += 1,
+        }
+    }
+
+    pub(crate) fn record_timeout_policy(
+        &mut self,
+        activity: LoopActivity,
+        timeout_ms: u32,
+        timeout_limit_ms: u32,
+    ) {
+        self.last_activity = activity;
+        self.last_timeout_ms = timeout_ms;
+        self.last_timeout_limit_ms = timeout_limit_ms;
+    }
+}
+
 #[derive(Deref, DerefMut, Resource)]
 pub struct LowPowerMode(pub bool);
 
@@ -543,7 +613,7 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     }
 }
 
-pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
+pub fn setup_bevy_app(sender: EventSender, receiver: WakeableEventQueue) -> Result<BevyApp> {
     let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
     let watcher = window_manager.setup_config_watcher(CONFIGURATION_FILE.as_path())?;
 
@@ -560,6 +630,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Initializing)
+        .insert_resource(LoopDiagnostics::default())
         .insert_non_send_resource(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)

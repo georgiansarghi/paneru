@@ -107,6 +107,11 @@ pub enum QueryCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Prints runtime loop wake counters and timeout diagnostics.
+    RuntimeDiagnostics {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The main entry point of the `paneru` application.
@@ -179,6 +184,7 @@ impl QueryCmd {
             QueryCmd::State { json: _ } => StateQueryKind::State,
             QueryCmd::VirtualWorkspaces { json: _ } => StateQueryKind::VirtualWorkspaces,
             QueryCmd::Active { json: _ } => StateQueryKind::Active,
+            QueryCmd::RuntimeDiagnostics { json: _ } => StateQueryKind::RuntimeDiagnostics,
         }
     }
 }
