@@ -4,7 +4,7 @@ use accessibility_sys::{AXError, AXObserverRef, AXUIElementRef};
 use objc2::MainThreadMarker;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
-use objc2_core_foundation::CFString;
+use objc2_core_foundation::{CFRunLoop, CFString, kCFRunLoopDefaultMode};
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSProcessInfo};
 use std::ffi::c_void;
 use std::pin::Pin;
@@ -234,6 +234,44 @@ impl PlatformCallbacks {
     }
 
     pub fn pump_cocoa_event_loop(&mut self, timeout: f64) {
+        if legacy_cocoa_pump_enabled() {
+            self.pump_cocoa_event_loop_legacy(timeout);
+        } else {
+            self.pump_cocoa_event_loop_wakeable(timeout);
+        }
+    }
+
+    fn pump_cocoa_event_loop_wakeable(&mut self, timeout: f64) {
+        autoreleasepool(|_| {
+            // Spike for perf-04: let any CFRunLoop source wake the main loop,
+            // not only AppKit NSEvents. CGEventTap/AX callbacks can enqueue
+            // Paneru internal events without producing a dequeued NSEvent; the
+            // legacy `nextEventMatchingMask:untilDate:` wait can then sit until
+            // the full timeout. CFRunLoopRunInMode(..., returnAfterSource=true)
+            // returns as soon as those sources are handled.
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, timeout, true);
+
+            // Process AppKit events that are already pending, but do not block
+            // here. Blocking is handled by CFRunLoopRunInMode above so callback
+            // sources and posted AppKit events share one wake point.
+            let now = NSDate::dateWithTimeIntervalSinceNow(0.0);
+            while let Some(event) = unsafe {
+                self.cocoa_app
+                    .nextEventMatchingMask_untilDate_inMode_dequeue(
+                        NSEventMask::Any,
+                        Some(&now),
+                        NSDefaultRunLoopMode,
+                        true,
+                    )
+            } {
+                self.cocoa_app.sendEvent(&event);
+            }
+
+            self.cocoa_app.updateWindows();
+        });
+    }
+
+    fn pump_cocoa_event_loop_legacy(&mut self, timeout: f64) {
         autoreleasepool(|_| {
             let until_date = NSDate::dateWithTimeIntervalSinceNow(timeout);
 
@@ -256,6 +294,11 @@ impl PlatformCallbacks {
             self.cocoa_app.updateWindows();
         });
     }
+}
+
+fn legacy_cocoa_pump_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PANERU_LEGACY_COCOA_PUMP").is_some())
 }
 
 impl Modifiers {

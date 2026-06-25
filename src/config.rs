@@ -521,7 +521,6 @@ impl Config {
             Some(SwipeGestureHorizontalConfig::Action(action)) if legacy_fingers_match => {
                 action.clone()
             }
-            Some(SwipeGestureHorizontalConfig::Action(_)) => SwipeGestureHorizontalAction::Disabled,
             Some(SwipeGestureHorizontalConfig::Rules(rules)) => rules
                 .iter()
                 .find(|rule| rule.fingers_count == fingers_count)
@@ -529,7 +528,9 @@ impl Config {
                     rule.action.clone()
                 }),
             None if legacy_fingers_match => SwipeGestureHorizontalAction::Scroll,
-            None => SwipeGestureHorizontalAction::Disabled,
+            Some(SwipeGestureHorizontalConfig::Action(_)) | None => {
+                SwipeGestureHorizontalAction::Disabled
+            }
         }
     }
 

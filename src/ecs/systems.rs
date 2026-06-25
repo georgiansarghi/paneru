@@ -15,7 +15,7 @@ use bevy::time::Time;
 use objc2_foundation::NSPoint;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -29,10 +29,11 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    LoopActivity, LoopDiagnostics, LoopWakeReason, LowPowerMode, MissionControlActive, Position,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    Unmanaged, WidthRatio, WindowProperties,
 };
-use crate::events::Event;
+use crate::events::{Event, WakeableEventQueue};
 use crate::manager::{
     Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
@@ -40,10 +41,71 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{PlatformCallbacks, WinID};
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
-const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 500;
-const LOOP_MAX_TIMEOUT_MS: u32 = 50;
+const LOOP_FRAME_DEADLINE_MS: u32 = 16;
+const LOOP_IDLE_WATCHDOG_DEADLINE_MS: u32 = 100;
+const LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS: u32 = 500;
 const LOOP_TIMEOUT_STEP: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoopDeadline {
+    pub timeout_ms: u32,
+    pub limit_ms: u32,
+    pub reason: LoopWakeReason,
+}
+
+pub(crate) fn loop_deadline(
+    activity: LoopActivity,
+    next_timer_remaining: Option<Duration>,
+) -> LoopDeadline {
+    let (limit_ms, reason) = if activity.frame_active() {
+        (LOOP_FRAME_DEADLINE_MS, classify_timeout_wake(activity))
+    } else if activity.low_power {
+        (
+            LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS,
+            LoopWakeReason::TimeoutWatchdog,
+        )
+    } else {
+        (
+            LOOP_IDLE_WATCHDOG_DEADLINE_MS,
+            LoopWakeReason::TimeoutWatchdog,
+        )
+    };
+
+    let timeout_ms = next_timer_remaining
+        .map(duration_to_timeout_ms)
+        .map_or(limit_ms, |timer_ms| timer_ms.min(limit_ms));
+
+    LoopDeadline {
+        timeout_ms,
+        limit_ms,
+        reason,
+    }
+}
+
+fn duration_to_timeout_ms(duration: Duration) -> u32 {
+    let millis = duration.as_millis();
+    if millis == 0 {
+        LOOP_TIMEOUT_STEP
+    } else {
+        millis.min(u128::from(u32::MAX)) as u32
+    }
+}
+
+pub(crate) const fn classify_timeout_wake(activity: LoopActivity) -> LoopWakeReason {
+    if activity.flash_message {
+        LoopWakeReason::FlashMessageActive
+    } else if activity.repositioning || activity.resizing || activity.scrolling {
+        LoopWakeReason::FrameActive
+    } else {
+        LoopWakeReason::TimeoutWatchdog
+    }
+}
+
+pub(super) fn record_periodic_maintenance(mut diagnostics: Option<ResMut<LoopDiagnostics>>) {
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.record(LoopWakeReason::PeriodicMaintenance);
+    }
+}
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -541,19 +603,24 @@ pub(super) fn pump_events(
     mut exit: MessageWriter<AppExit>,
     mut messages: MessageWriter<Event>,
     low_power_mode: Option<Res<LowPowerMode>>,
-    incoming_events: Option<NonSend<Receiver<Event>>>,
+    incoming_events: Option<NonSend<WakeableEventQueue>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     repositioning: Query<(), With<RepositionMarker>>,
     resizing: Query<(), With<ResizeMarker>>,
     scrolling: Query<(), With<Scrolling>>,
     flash_messages: Query<(), With<FlashMessage>>,
+    timeouts: Query<&Timeout>,
     mut timeout: Local<u32>,
+    mut diagnostics: Option<ResMut<LoopDiagnostics>>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
         return;
     };
 
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.record(LoopWakeReason::CocoaEventPump);
+    }
     platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
     let mut received_events = Vec::new();
     let mut pending_mouse = None;
@@ -561,10 +628,16 @@ pub(super) fn pump_events(
         // Repeatedly drain the events until timeout.
         match incoming_events.recv_timeout(Duration::from_millis(1)) {
             Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(diagnostics) = diagnostics.as_mut() {
+                    diagnostics.record(LoopWakeReason::InternalEvent);
+                }
                 exit.write(AppExit::Success);
                 break;
             }
             Ok(event) => {
+                if let Some(diagnostics) = diagnostics.as_mut() {
+                    diagnostics.record(LoopWakeReason::InternalEvent);
+                }
                 if matches!(event, Event::MouseMoved { .. }) {
                     pending_mouse = Some(event);
                 } else {
@@ -576,19 +649,27 @@ pub(super) fn pump_events(
             Err(RecvTimeoutError::Timeout) => {
                 received_events.extend(pending_mouse.take());
                 messages.write_batch(received_events);
-                let frame_active = !repositioning.is_empty()
-                    || !resizing.is_empty()
-                    || !scrolling.is_empty()
-                    || !flash_messages.is_empty();
-                let low_power = low_power_mode.is_some_and(|low_power| low_power.0);
-                let timeout_limit = if frame_active {
-                    LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
-                } else if low_power {
-                    LOOP_MAX_TIMEOUT_LOWPOWER_MS
-                } else {
-                    LOOP_MAX_TIMEOUT_MS
+                let activity = LoopActivity {
+                    repositioning: !repositioning.is_empty(),
+                    resizing: !resizing.is_empty(),
+                    scrolling: !scrolling.is_empty(),
+                    flash_message: !flash_messages.is_empty(),
+                    low_power: low_power_mode.is_some_and(|low_power| low_power.0),
                 };
-                *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
+                let next_timer_remaining = timeouts
+                    .iter()
+                    .map(|timeout| timeout.timer.remaining())
+                    .min();
+                let deadline = loop_deadline(activity, next_timer_remaining);
+                if let Some(diagnostics) = diagnostics.as_mut() {
+                    diagnostics.record(deadline.reason);
+                    diagnostics.record_timeout_policy(
+                        activity,
+                        deadline.timeout_ms,
+                        deadline.limit_ms,
+                    );
+                }
+                *timeout = deadline.timeout_ms;
                 break;
             }
         }
@@ -710,7 +791,7 @@ pub(super) fn window_moved_update_frame(
 
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn gather_initial_processes(
-    receiver: Option<NonSendMut<Receiver<Event>>>,
+    receiver: Option<NonSendMut<WakeableEventQueue>>,
     mut displays: Query<&mut Display>,
     mut commands: Commands,
 ) {
@@ -1527,4 +1608,122 @@ fn ordered_tab_group(group: &[TabReconcileCandidate]) -> Vec<Entity> {
         .into_iter()
         .map(|candidate| candidate.entity)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_policy_uses_frame_deadline_for_active_work() {
+        for activity in [
+            LoopActivity {
+                repositioning: true,
+                ..LoopActivity::default()
+            },
+            LoopActivity {
+                resizing: true,
+                ..LoopActivity::default()
+            },
+            LoopActivity {
+                scrolling: true,
+                ..LoopActivity::default()
+            },
+            LoopActivity {
+                flash_message: true,
+                low_power: true,
+                ..LoopActivity::default()
+            },
+        ] {
+            let deadline = loop_deadline(activity, None);
+            assert_eq!(deadline.timeout_ms, LOOP_FRAME_DEADLINE_MS);
+            assert_eq!(deadline.limit_ms, LOOP_FRAME_DEADLINE_MS);
+        }
+    }
+
+    #[test]
+    fn deadline_policy_uses_longer_idle_watchdog_than_legacy_polling() {
+        let deadline = loop_deadline(LoopActivity::default(), None);
+
+        assert_eq!(deadline.timeout_ms, LOOP_IDLE_WATCHDOG_DEADLINE_MS);
+        assert!(deadline.timeout_ms > 50);
+        assert_eq!(deadline.reason, LoopWakeReason::TimeoutWatchdog);
+    }
+
+    #[test]
+    fn deadline_policy_distinguishes_low_power() {
+        let deadline = loop_deadline(
+            LoopActivity {
+                low_power: true,
+                ..LoopActivity::default()
+            },
+            None,
+        );
+
+        assert_eq!(
+            deadline.timeout_ms,
+            LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS
+        );
+    }
+
+    #[test]
+    fn deadline_policy_never_sleeps_past_pending_timeout() {
+        let deadline = loop_deadline(LoopActivity::default(), Some(Duration::from_millis(75)));
+
+        assert_eq!(deadline.timeout_ms, 75);
+        assert_eq!(deadline.limit_ms, LOOP_IDLE_WATCHDOG_DEADLINE_MS);
+    }
+
+    #[test]
+    fn deadline_policy_clamps_finished_timeout_to_one_millisecond() {
+        let deadline = loop_deadline(LoopActivity::default(), Some(Duration::ZERO));
+
+        assert_eq!(deadline.timeout_ms, LOOP_TIMEOUT_STEP);
+    }
+
+    #[test]
+    fn timeout_wake_classification_prefers_specific_active_reasons() {
+        assert_eq!(
+            classify_timeout_wake(LoopActivity {
+                repositioning: true,
+                ..LoopActivity::default()
+            }),
+            LoopWakeReason::FrameActive
+        );
+        assert_eq!(
+            classify_timeout_wake(LoopActivity {
+                flash_message: true,
+                repositioning: true,
+                ..LoopActivity::default()
+            }),
+            LoopWakeReason::FlashMessageActive
+        );
+        assert_eq!(
+            classify_timeout_wake(LoopActivity::default()),
+            LoopWakeReason::TimeoutWatchdog
+        );
+    }
+
+    #[test]
+    fn diagnostics_accumulates_wake_reasons_and_last_timeout_policy() {
+        let mut diagnostics = LoopDiagnostics::default();
+        diagnostics.record(LoopWakeReason::CocoaEventPump);
+        diagnostics.record(LoopWakeReason::InternalEvent);
+        diagnostics.record(LoopWakeReason::FrameActive);
+        diagnostics.record_timeout_policy(
+            LoopActivity {
+                scrolling: true,
+                ..LoopActivity::default()
+            },
+            4,
+            LOOP_FRAME_DEADLINE_MS,
+        );
+
+        assert_eq!(diagnostics.counters.cocoa_event_pump, 1);
+        assert_eq!(diagnostics.counters.internal_event, 1);
+        assert_eq!(diagnostics.counters.frame_active, 1);
+        assert!(diagnostics.last_activity.scrolling);
+        assert_eq!(diagnostics.last_timeout_ms, 4);
+        assert_eq!(diagnostics.last_timeout_limit_ms, LOOP_FRAME_DEADLINE_MS);
+    }
 }
