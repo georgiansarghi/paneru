@@ -157,6 +157,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_flash_messages,
             )
                 .chain(),
+            systems::reconcile_tabbed_windows
+                .run_if(native_tabs_enabled)
+                .run_if(not_swiping),
             crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
         ),
     );

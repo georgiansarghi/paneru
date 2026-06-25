@@ -256,10 +256,18 @@ impl Windows<'_, '_> {
     }
 
     pub fn find(&self, window_id: WinID) -> Option<(&Window, Entity)> {
+        self.find_with_unmanaged(window_id)
+            .map(|(window, entity, _)| (window, entity))
+    }
+
+    pub fn find_with_unmanaged(
+        &self,
+        window_id: WinID,
+    ) -> Option<(&Window, Entity, Option<&Unmanaged>)> {
         self.all
             .into_iter()
             .find(|(window, _, _, _)| window.id() == window_id)
-            .map(|(window, entity, _, _)| (window, entity))
+            .map(|(window, entity, _, unmanaged)| (window, entity, unmanaged))
     }
 
     pub fn find_parent(&self, window_id: WinID) -> Option<(&Window, Entity, Entity)> {

@@ -307,3 +307,209 @@ fn test_same_app_same_frame_native_tab_reuses_existing_column() {
         })
         .run(commands);
 }
+
+fn spawn_matching_window_without_native_tab_settling(
+    world: &mut World,
+    state: &MockState,
+    leader_window_id: WinID,
+    new_window_id: WinID,
+) {
+    let leader = find_window_entity(leader_window_id, world);
+    let frame = world
+        .get::<Window>(leader)
+        .map(|window| window.frame())
+        .expect("frame should exist");
+    let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, new_window_id, frame);
+    world.trigger(SpawnWindowTrigger(vec![window]));
+}
+
+#[test]
+fn test_native_tab_reconciliation_groups_missed_creation_race() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |world, state| {
+            // Simulate the creation-time race: the new tab has the same frame,
+            // but CGWindowList still reports the old leader as visible, so the
+            // Added<Window> detector must not group it yet.
+            spawn_matching_window_without_native_tab_settling(world, &state, 0, 1);
+        })
+        .on_iteration(1, move |world, state| {
+            let tab_zero = find_window_entity(0, world);
+            let tab_one = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+
+            assert!(!strip.tabbed(tab_zero));
+            assert!(!strip.tabbed(tab_one));
+            assert_eq!(
+                strip.len(),
+                2,
+                "creation-time detector should miss while both windows are on-screen"
+            );
+
+            // After the native-tab state settles, only the selected tab remains
+            // on-screen and both AX windows report the shared native window frame.
+            let frame = world
+                .get::<Window>(tab_one)
+                .map(|window| window.frame())
+                .expect("frame should exist");
+            state.update_window(0, |window| window.frame = frame);
+            state.window_visible(0, false);
+        })
+        .on_iteration(2, move |world, _state| {
+            let tab_zero = find_window_entity(0, world);
+            let tab_one = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+
+            assert_eq!(
+                strip.len(),
+                1,
+                "reconciler should fold settled native tabs into one column"
+            );
+            assert_eq!(strip.tab_group(tab_one), Some(vec![tab_one, tab_zero]));
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_native_tab_reconciliation_keeps_two_visible_windows_separate() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |world, state| {
+            spawn_matching_window_without_native_tab_settling(world, &state, 0, 1);
+        })
+        .on_iteration(1, move |world, _state| {
+            let first = find_window_entity(0, world);
+            let second = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+
+            assert_eq!(strip.len(), 2);
+            assert!(!strip.tabbed(first));
+            assert!(!strip.tabbed(second));
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_native_tab_reconciliation_splits_visible_tab_group() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |world, state| {
+            spawn_matching_native_tab(world, &state, 0);
+        })
+        .on_iteration(1, move |world, state| {
+            let tab_zero = find_window_entity(0, world);
+            let tab_one = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+            assert_eq!(strip.tab_group(tab_one), Some(vec![tab_one, tab_zero]));
+
+            // If CGWindowList later reports both members of a supposed tab group
+            // as real on-screen windows, this is not a native-tab strip anymore;
+            // it is two separate windows that happen to have the same frame.
+            state.window_visible(0, true);
+            state.window_visible(1, true);
+        })
+        .on_iteration(3, move |world, _state| {
+            let tab_zero = find_window_entity(0, world);
+            let tab_one = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+
+            assert_eq!(strip.len(), 2);
+            assert!(!strip.tabbed(tab_zero));
+            assert!(!strip.tabbed(tab_one));
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_native_tab_reconciliation_requires_matching_frames() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |world, state| {
+            let leader = find_window_entity(0, world);
+            let mut frame = world
+                .get::<Window>(leader)
+                .map(|window| window.frame())
+                .expect("frame should exist");
+            frame.min.x += 80;
+            frame.max.x += 80;
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 1, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(1, move |_world, state| {
+            state.window_visible(0, false);
+        })
+        .on_iteration(2, move |world, _state| {
+            let first = find_window_entity(0, world);
+            let second = find_window_entity(1, world);
+            let mut query = world.query::<(&LayoutStrip, Has<ActiveWorkspaceMarker>)>();
+            let strip = query
+                .iter(world)
+                .find_map(|(strip, active)| active.then_some(strip))
+                .expect("active strip not found");
+
+            assert_eq!(strip.len(), 2);
+            assert!(!strip.tabbed(first));
+            assert!(!strip.tabbed(second));
+        })
+        .run(commands);
+}
