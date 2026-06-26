@@ -14,7 +14,7 @@ use bevy::ecs::world::World;
 use bevy::tasks::tick_global_task_pools_on_main_thread;
 use objc2_core_foundation::{
     CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
-    kCFRunLoopCommonModes,
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use tracing::{debug, trace, warn};
 
@@ -144,19 +144,34 @@ impl RuntimeDeadlines {
         self.deadlines.remove(&reason);
     }
 
+    pub(crate) fn due(&self, now: Duration, reason: DeadlineReason) -> bool {
+        self.deadlines
+            .get(&reason)
+            .is_some_and(|deadline| *deadline <= now)
+    }
+
+    pub(crate) fn due_reasons(&self, now: Duration) -> Vec<DeadlineReason> {
+        self.deadlines
+            .iter()
+            .filter_map(|(reason, deadline)| (*deadline <= now).then_some(*reason))
+            .collect()
+    }
+
     pub(crate) fn ensure_repeating_after(
         &mut self,
         now: Duration,
         reason: DeadlineReason,
         period: Duration,
-    ) {
+    ) -> bool {
         if self
             .deadlines
             .get(&reason)
             .is_none_or(|deadline| *deadline <= now)
         {
             self.set_after(now, reason, period);
+            return true;
         }
+        false
     }
 
     fn earliest(&self) -> Option<RuntimeDeadline> {
@@ -166,7 +181,7 @@ impl RuntimeDeadlines {
             .map(|(reason, at)| RuntimeDeadline::new(*at, *reason))
     }
 
-    fn earliest_wait(&self, now: Duration) -> Option<WaitDeadline> {
+    pub(crate) fn earliest_wait(&self, now: Duration) -> Option<WaitDeadline> {
         self.earliest().map(|deadline| WaitDeadline {
             duration: deadline.at.saturating_sub(now),
             reason: deadline.reason,
@@ -211,7 +226,7 @@ impl RuntimeActivity {
         self.reasons.insert(reason);
     }
 
-    fn recent(&self, now: Duration, grace: Duration) -> bool {
+    pub(crate) fn recent(&self, now: Duration, grace: Duration) -> bool {
         self.last_activity
             .is_some_and(|last| now.saturating_sub(last) < grace)
     }
@@ -259,42 +274,65 @@ impl RuntimeDirty {
 }
 
 struct RuntimeDriver {
-    next_timeout_ms: u32,
-    deadline_timer: Option<MainRunLoopDeadlineTimer>,
+    next_decision: RunnerDecision,
+    run_loop_waiter: Option<MainRunLoopWaiter>,
 }
 
 impl RuntimeDriver {
-    const TIMEOUT_STEP_MS: u32 = 1;
-
     fn legacy_equivalent() -> Self {
         Self {
-            next_timeout_ms: 0,
-            deadline_timer: MainRunLoopDeadlineTimer::new(),
+            next_decision: RunnerDecision::Wait(WaitDeadline {
+                duration: MIN_OS_WAIT_DURATION,
+                reason: DeadlineReason::IdleWatchdog,
+            }),
+            run_loop_waiter: MainRunLoopWaiter::new(),
         }
     }
 
     #[cfg(test)]
     const fn without_deadline_timer_for_tests() -> Self {
         Self {
-            next_timeout_ms: 0,
-            deadline_timer: None,
+            next_decision: RunnerDecision::Wait(WaitDeadline {
+                duration: MIN_OS_WAIT_DURATION,
+                reason: DeadlineReason::IdleWatchdog,
+            }),
+            run_loop_waiter: None,
         }
     }
 
-    fn wait_and_drain_before_update(&mut self, app: &mut App) {
-        let timeout = Duration::from_millis(u64::from(self.next_timeout_ms));
-        if let Some(timer) = &mut self.deadline_timer {
-            timer.schedule_after(timeout);
+    fn wait_and_drain_before_update(&mut self, app: &mut App) -> Option<AppExit> {
+        let timeout = match self.next_decision {
+            RunnerDecision::RunUpdateNow(reason) => {
+                trace!(?reason, "runtime policy requested immediate update");
+                return None;
+            }
+            RunnerDecision::Wait(wait) => clamp_os_wait_duration(wait.duration),
+            RunnerDecision::Exit => return Some(AppExit::Success),
+        };
+
+        if appkit_blocking_wait_forced() {
+            pump_platform(app.world_mut(), timeout);
+        } else if let Some(waiter) = &mut self.run_loop_waiter {
+            let outcome = waiter.wait(timeout);
+            if outcome.deadline_fired {
+                trace!("runner-owned deadline timer fired");
+            }
+            drain_platform_events_nonblocking(app.world_mut());
+        } else {
+            pump_platform(app.world_mut(), timeout);
         }
-        pump_platform(app.world_mut(), timeout);
         if drain_external_events(app.world_mut()) {
             mark_runtime_activity(app.world_mut(), RuntimeActivityReason::ExternalEvent);
             self.note_internal_event();
         }
+        None
     }
 
     fn note_internal_event(&mut self) {
-        self.next_timeout_ms = Self::TIMEOUT_STEP_MS;
+        self.next_decision = RunnerDecision::Wait(WaitDeadline {
+            duration: MIN_OS_WAIT_DURATION,
+            reason: DeadlineReason::RecentInteractiveActivity,
+        });
     }
 
     fn update_until_settled(&mut self, app: &mut App) -> Option<AppExit> {
@@ -335,7 +373,14 @@ impl RuntimeDriver {
         let activity = collect_loop_activity(app.world_mut());
         let timeout_limit = loop_timeout_limit_ms(activity);
         let visible_deadline = next_visible_runtime_deadline(app.world_mut());
-        let next_timeout = self.next_timeout_ms(app.world_mut(), activity, visible_deadline);
+        let next_decision =
+            self.guard_repeated_immediate_deadline(Self::next_decision_after_update(
+                app.world_mut(),
+                activity,
+                visible_deadline,
+                legacy_idle_cadence_forced(),
+            ));
+        let next_timeout = scheduled_timeout_ms(next_decision);
         let activity_snapshot = runtime_activity_snapshot(app.world_mut());
         if let Some(mut diagnostics) = app.world_mut().get_resource_mut::<LoopDiagnostics>() {
             diagnostics.record(classify_timeout_wake(activity));
@@ -343,36 +388,51 @@ impl RuntimeDriver {
             diagnostics.record_runner_deadline(visible_deadline);
             diagnostics.record_runtime_activity(activity_snapshot);
         }
-        self.next_timeout_ms = next_timeout;
+        self.next_decision = next_decision;
     }
 
+    fn next_decision_after_update(
+        world: &mut World,
+        activity: LoopActivity,
+        visible_deadline: Option<WaitDeadline>,
+        legacy_idle_cadence_forced: bool,
+    ) -> RunnerDecision {
+        production_policy(legacy_idle_cadence_forced).decide(runtime_driver_state_after_update(
+            world,
+            activity,
+            visible_deadline,
+        ))
+    }
+
+    fn guard_repeated_immediate_deadline(&self, decision: RunnerDecision) -> RunnerDecision {
+        // A freshly due visible deadline should run Bevy immediately so the
+        // owning system can perform or reschedule its work. If the same due
+        // deadline survives that update, clamp to the minimum OS wait instead
+        // of creating a zero-timeout CPU spin on stale deadline state.
+        match (self.next_decision, decision) {
+            (
+                RunnerDecision::RunUpdateNow(UpdateReason::DeadlineElapsed(previous)),
+                RunnerDecision::RunUpdateNow(UpdateReason::DeadlineElapsed(current)),
+            ) if previous == current => RunnerDecision::Wait(WaitDeadline {
+                duration: MIN_OS_WAIT_DURATION,
+                reason: current,
+            }),
+            _ => decision,
+        }
+    }
+
+    #[cfg(test)]
     fn next_timeout_ms(
-        &self,
         world: &mut World,
         activity: LoopActivity,
         visible_deadline: Option<WaitDeadline>,
     ) -> u32 {
-        let legacy_limit = loop_timeout_limit_ms(activity);
-        let legacy_next = self.next_timeout_ms.min(legacy_limit) + Self::TIMEOUT_STEP_MS;
-        let mut next_timeout = if legacy_idle_cadence_forced() || activity.frame_active() {
-            legacy_next
-        } else if runtime_recent_activity(world) {
-            legacy_next.min(RuntimeDriverConfig::legacy_equivalent().interactive_idle_cap_ms())
-        } else {
-            let quiet_cap = if activity.low_power {
-                RuntimeDriverConfig::legacy_equivalent().low_power_watchdog_cap_ms()
-            } else {
-                adaptive_quiet_idle_cap_ms()
-            };
-            visible_deadline.map_or(quiet_cap, |deadline| {
-                duration_to_timeout_ms(deadline.duration).min(quiet_cap)
-            })
-        };
-
-        if let Some(deadline) = visible_deadline {
-            next_timeout = next_timeout.min(duration_to_timeout_ms(deadline.duration));
-        }
-        next_timeout
+        scheduled_timeout_ms(Self::next_decision_after_update(
+            world,
+            activity,
+            visible_deadline,
+            false,
+        ))
     }
 }
 
@@ -406,16 +466,30 @@ pub(crate) fn mark_runtime_activity(world: &mut World, reason: RuntimeActivityRe
     }
 }
 
-fn runtime_recent_activity(world: &mut World) -> bool {
+fn runtime_driver_state_after_update(
+    world: &mut World,
+    activity: LoopActivity,
+    visible_deadline: Option<WaitDeadline>,
+) -> RuntimeDriverState {
     let now = world.resource::<RuntimeDeadlineClock>().now();
-    world
-        .get_resource::<RuntimeActivity>()
-        .is_some_and(|activity| {
-            activity.recent(
-                now,
-                RuntimeDriverConfig::legacy_equivalent().interactive_grace_period,
-            )
-        })
+    RuntimeDriverState {
+        now,
+        active_work: ActiveRuntimeWork {
+            repositioning: activity.repositioning,
+            resizing: activity.resizing,
+            scrolling: activity.scrolling,
+            flash_message: activity.flash_message,
+        },
+        last_interactive_activity: world
+            .get_resource::<RuntimeActivity>()
+            .and_then(|activity| activity.last_activity),
+        next_visible_deadline: visible_deadline.map(|deadline| RuntimeDeadline {
+            at: now + deadline.duration,
+            reason: deadline.reason,
+        }),
+        low_power: activity.low_power,
+        ..RuntimeDriverState::default()
+    }
 }
 
 pub(crate) fn runtime_activity_snapshot(world: &mut World) -> (bool, Vec<&'static str>) {
@@ -439,8 +513,68 @@ fn next_visible_runtime_deadline(world: &mut World) -> Option<WaitDeadline> {
     world.resource::<RuntimeDeadlines>().earliest_wait(now)
 }
 
+const MIN_OS_WAIT_DURATION: Duration = Duration::from_millis(1);
+
+fn production_policy(legacy_idle_cadence_forced: bool) -> RuntimeDriverPolicy {
+    RuntimeDriverPolicy::new(RuntimeDriverConfig::production(legacy_idle_cadence_forced))
+}
+
+fn scheduled_timeout_ms(decision: RunnerDecision) -> u32 {
+    match decision {
+        RunnerDecision::Wait(wait) => duration_to_timeout_ms(clamp_os_wait_duration(wait.duration)),
+        RunnerDecision::RunUpdateNow(_) | RunnerDecision::Exit => 0,
+    }
+}
+
+fn clamp_os_wait_duration(duration: Duration) -> Duration {
+    duration.max(MIN_OS_WAIT_DURATION)
+}
+
 fn duration_to_timeout_ms(duration: Duration) -> u32 {
-    duration.as_millis().try_into().unwrap_or(u32::MAX)
+    if duration.is_zero() {
+        return 0;
+    }
+
+    let whole_millis = duration.as_millis();
+    let rounded_millis = if duration.subsec_nanos().is_multiple_of(1_000_000) {
+        whole_millis
+    } else {
+        whole_millis.saturating_add(1)
+    };
+    rounded_millis.try_into().unwrap_or(u32::MAX)
+}
+
+struct MainRunLoopWaiter {
+    deadline_timer: MainRunLoopDeadlineTimer,
+}
+
+impl MainRunLoopWaiter {
+    fn new() -> Option<Self> {
+        Some(Self {
+            deadline_timer: MainRunLoopDeadlineTimer::new()?,
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) -> RunnerWaitOutcome {
+        self.deadline_timer.schedule_after(timeout);
+        trace!(
+            timeout_ms = timeout.as_millis(),
+            "waiting on runner-owned CFRunLoop source/timer set"
+        );
+        CFRunLoop::run_in_mode(
+            unsafe { kCFRunLoopDefaultMode },
+            timeout.as_secs_f64(),
+            true,
+        );
+        RunnerWaitOutcome {
+            deadline_fired: self.deadline_timer.take_fired(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunnerWaitOutcome {
+    deadline_fired: bool,
 }
 
 struct MainRunLoopDeadlineTimer {
@@ -483,6 +617,10 @@ impl MainRunLoopDeadlineTimer {
         self.fired.store(false, Ordering::SeqCst);
         self.timer
             .set_next_fire_date(CFAbsoluteTimeGetCurrent() + duration.as_secs_f64());
+    }
+
+    fn take_fired(&self) -> bool {
+        self.fired.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -546,6 +684,20 @@ fn custom_runtime_driver_enabled() -> bool {
 }
 
 #[must_use]
+pub const fn appkit_blocking_wait_forced_for_env(env_present: bool) -> bool {
+    env_present
+}
+
+fn appkit_blocking_wait_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        appkit_blocking_wait_forced_for_env(
+            std::env::var_os("PANERU_APPKIT_BLOCKING_WAIT").is_some(),
+        )
+    })
+}
+
+#[must_use]
 pub const fn legacy_idle_cadence_forced_for_env(env_present: bool) -> bool {
     env_present
 }
@@ -576,7 +728,9 @@ fn custom_runtime_runner(mut app: App) -> AppExit {
 
     driver.compute_next_wait_after_update(&mut app);
     loop {
-        driver.wait_and_drain_before_update(&mut app);
+        if let Some(exit) = driver.wait_and_drain_before_update(&mut app) {
+            return exit;
+        }
         if let Some(exit) = driver.update_until_settled(&mut app) {
             return exit;
         }
@@ -608,9 +762,22 @@ fn pump_platform(world: &mut World, timeout: Duration) {
     };
     trace!(
         timeout_ms = timeout.as_millis(),
-        "pumping Cocoa event loop from custom runner"
+        "pumping Cocoa event loop from AppKit blocking fallback"
     );
     platform.pump_cocoa_event_loop(timeout.as_secs_f64());
+}
+
+fn drain_platform_events_nonblocking(world: &mut World) {
+    if let Some(mut diagnostics) = world.get_resource_mut::<LoopDiagnostics>() {
+        diagnostics.record(LoopWakeReason::CocoaEventPump);
+    }
+
+    let Some(mut platform) = world.get_non_send_resource_mut::<Pin<Box<PlatformCallbacks>>>()
+    else {
+        return;
+    };
+    trace!("draining Cocoa event loop without blocking");
+    platform.drain_cocoa_event_loop_nonblocking();
 }
 
 fn drain_external_events(world: &mut World) -> bool {
@@ -703,12 +870,18 @@ impl RuntimeDriverConfig {
         }
     }
 
-    const fn interactive_idle_cap_ms(self) -> u32 {
-        self.interactive_idle_cap.as_millis() as u32
-    }
-
-    const fn low_power_watchdog_cap_ms(self) -> u32 {
-        self.low_power_watchdog_cap.as_millis() as u32
+    const fn production(legacy_idle_cadence_forced: bool) -> Self {
+        Self {
+            frame_interval: Duration::from_millis(16),
+            interactive_idle_cap: Duration::from_millis(50),
+            idle_watchdog_cap: if legacy_idle_cadence_forced {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(adaptive_quiet_idle_cap_ms() as u64)
+            },
+            low_power_watchdog_cap: Duration::from_millis(500),
+            interactive_grace_period: Duration::from_secs(1),
+        }
     }
 }
 
@@ -1016,6 +1189,70 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeWaitWake {
+        ExternalSource,
+        Timer,
+        Timeout,
+        Shutdown,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeRunLoopWaitSet {
+        source_signaled: bool,
+        timer_due: bool,
+        shutdown_requested: bool,
+        wait_count: usize,
+        schedule_count: usize,
+        invalidate_count: usize,
+    }
+
+    impl FakeRunLoopWaitSet {
+        fn signal_source(&mut self) {
+            self.source_signaled = true;
+        }
+
+        fn fire_timer(&mut self) {
+            self.timer_due = true;
+        }
+
+        fn request_shutdown(&mut self) {
+            self.shutdown_requested = true;
+        }
+
+        fn wait(&mut self, _timeout: Duration) -> FakeWaitWake {
+            self.wait_count += 1;
+            self.schedule_count += 1;
+            if self.shutdown_requested {
+                return FakeWaitWake::Shutdown;
+            }
+            if std::mem::take(&mut self.source_signaled) {
+                return FakeWaitWake::ExternalSource;
+            }
+            if std::mem::take(&mut self.timer_due) {
+                return FakeWaitWake::Timer;
+            }
+            FakeWaitWake::Timeout
+        }
+
+        fn invalidate(&mut self) {
+            self.invalidate_count += 1;
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeAppKitDrain {
+        pending_events: usize,
+        drain_calls: usize,
+    }
+
+    impl FakeAppKitDrain {
+        fn drain_nonblocking(&mut self) -> usize {
+            self.drain_calls += 1;
+            std::mem::take(&mut self.pending_events)
+        }
+    }
+
     #[derive(Debug, Default, PartialEq, Eq)]
     struct FakeDeadlineTimer {
         active_deadline: Option<Duration>,
@@ -1213,15 +1450,42 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_activity_grace_uses_fast_legacy_cadence() {
+    fn production_decision_for_active_animation_uses_frame_cadence() {
         let mut app = app_with_runtime_resources(Instant::now());
-        mark_runtime_activity(app.world_mut(), RuntimeActivityReason::Input);
-        let mut driver = RuntimeDriver::without_deadline_timer_for_tests();
-        driver.next_timeout_ms = 50;
 
         assert_eq!(
-            driver.next_timeout_ms(app.world_mut(), LoopActivity::default(), None),
-            50
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity {
+                    repositioning: true,
+                    ..LoopActivity::default()
+                },
+                None,
+                false,
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: Duration::from_millis(16),
+                reason: DeadlineReason::AnimationFrame,
+            })
+        );
+    }
+
+    #[test]
+    fn production_decision_for_recent_activity_uses_legacy_fast_cadence() {
+        let mut app = app_with_runtime_resources(Instant::now());
+        mark_runtime_activity(app.world_mut(), RuntimeActivityReason::Input);
+
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity::default(),
+                None,
+                false
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: Duration::from_millis(50),
+                reason: DeadlineReason::RecentInteractiveActivity,
+            })
         );
     }
 
@@ -1238,13 +1502,21 @@ mod tests {
                 DeadlineReason::NativeTabReconciliation,
                 Duration::from_millis(250),
             );
-        let mut driver = RuntimeDriver::without_deadline_timer_for_tests();
-        driver.next_timeout_ms = 50;
-
         let visible_deadline = next_visible_runtime_deadline(app.world_mut());
-        let next_timeout =
-            driver.next_timeout_ms(app.world_mut(), LoopActivity::default(), visible_deadline);
-        assert!((200..=250).contains(&next_timeout));
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity::default(),
+                visible_deadline,
+                false,
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: visible_deadline
+                    .expect("deadline should be visible")
+                    .duration,
+                reason: DeadlineReason::NativeTabReconciliation,
+            })
+        );
     }
 
     #[test]
@@ -1253,11 +1525,8 @@ mod tests {
         app.world_mut()
             .resource_mut::<RuntimeActivity>()
             .mark(Duration::ZERO, RuntimeActivityReason::Input);
-        let mut driver = RuntimeDriver::without_deadline_timer_for_tests();
-        driver.next_timeout_ms = 50;
-
         assert_eq!(
-            driver.next_timeout_ms(app.world_mut(), LoopActivity::default(), None),
+            RuntimeDriver::next_timeout_ms(app.world_mut(), LoopActivity::default(), None),
             adaptive_quiet_idle_cap_ms()
         );
     }
@@ -1272,18 +1541,24 @@ mod tests {
                 DeadlineReason::LostFocusWatchdog,
                 Duration::from_millis(250),
             );
-        let driver = RuntimeDriver::without_deadline_timer_for_tests();
-
         let visible_deadline = next_visible_runtime_deadline(app.world_mut());
-        let next_timeout = driver.next_timeout_ms(
-            app.world_mut(),
-            LoopActivity {
-                low_power: true,
-                ..LoopActivity::default()
-            },
-            visible_deadline,
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity {
+                    low_power: true,
+                    ..LoopActivity::default()
+                },
+                visible_deadline,
+                false,
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: visible_deadline
+                    .expect("deadline should be visible")
+                    .duration,
+                reason: DeadlineReason::LostFocusWatchdog,
+            })
         );
-        assert!((200..=250).contains(&next_timeout));
     }
 
     #[test]
@@ -1312,6 +1587,91 @@ mod tests {
     }
 
     #[test]
+    fn fake_run_loop_source_signal_returns_before_update() {
+        let mut wait_set = FakeRunLoopWaitSet::default();
+        let mut update_ran = false;
+
+        wait_set.signal_source();
+        let wake = wait_set.wait(Duration::from_secs(1));
+        assert_eq!(wake, FakeWaitWake::ExternalSource);
+        assert!(!update_ran, "wait must return control before Bevy update");
+
+        update_ran = true;
+        assert!(update_ran);
+        assert_eq!(wait_set.wait_count, 1);
+    }
+
+    #[test]
+    fn fake_run_loop_timer_fires_once_and_can_be_rescheduled() {
+        let mut wait_set = FakeRunLoopWaitSet::default();
+
+        wait_set.fire_timer();
+        assert_eq!(
+            wait_set.wait(Duration::from_millis(250)),
+            FakeWaitWake::Timer
+        );
+        assert_eq!(
+            wait_set.wait(Duration::from_millis(250)),
+            FakeWaitWake::Timeout
+        );
+        wait_set.fire_timer();
+        assert_eq!(
+            wait_set.wait(Duration::from_millis(500)),
+            FakeWaitWake::Timer
+        );
+        assert_eq!(wait_set.schedule_count, 3);
+    }
+
+    #[test]
+    fn fake_burst_external_signals_coalesce_without_losing_events() {
+        let mut wait_set = FakeRunLoopWaitSet::default();
+        let queued_events = 128;
+
+        for _ in 0..queued_events {
+            wait_set.signal_source();
+        }
+
+        assert_eq!(
+            wait_set.wait(Duration::from_secs(1)),
+            FakeWaitWake::ExternalSource
+        );
+        assert_eq!(queued_events, 128);
+        assert_eq!(wait_set.wait_count, 1);
+    }
+
+    #[test]
+    fn fake_appkit_drain_is_nonblocking_and_drains_pending_events() {
+        let mut appkit = FakeAppKitDrain {
+            pending_events: 3,
+            drain_calls: 0,
+        };
+
+        assert_eq!(appkit.drain_nonblocking(), 3);
+        assert_eq!(appkit.drain_nonblocking(), 0);
+        assert_eq!(appkit.drain_calls, 2);
+    }
+
+    #[test]
+    fn fake_shutdown_invalidates_wait_set() {
+        let mut wait_set = FakeRunLoopWaitSet::default();
+
+        wait_set.request_shutdown();
+        assert_eq!(
+            wait_set.wait(Duration::from_secs(1)),
+            FakeWaitWake::Shutdown
+        );
+        wait_set.invalidate();
+
+        assert_eq!(wait_set.invalidate_count, 1);
+    }
+
+    #[test]
+    fn appkit_blocking_wait_fallback_env_is_modeled() {
+        assert!(!appkit_blocking_wait_forced_for_env(false));
+        assert!(appkit_blocking_wait_forced_for_env(true));
+    }
+
+    #[test]
     fn fake_deadline_timer_rescheduling_replaces_old_deadline() {
         let mut timer = FakeDeadlineTimer::default();
 
@@ -1335,17 +1695,94 @@ mod tests {
     }
 
     #[test]
-    fn custom_runner_resets_timeout_ramp_after_internal_events() {
-        // The legacy in-system pump resets its timeout ramp whenever it drains
-        // an internal event. The custom runner must preserve that behavior or a
-        // user command arriving after idle can be followed by another ~50 ms
-        // wait, which feels like the perf-04 latency regression.
+    fn custom_runner_records_minimum_wait_after_internal_events() {
+        // Draining an external/internal event should never leave the runner on a
+        // long quiet-idle wait before Bevy has a chance to process the event.
         let mut driver = RuntimeDriver::without_deadline_timer_for_tests();
-        driver.next_timeout_ms = 50;
 
         driver.note_internal_event();
 
-        assert_eq!(driver.next_timeout_ms, RuntimeDriver::TIMEOUT_STEP_MS);
+        assert_eq!(scheduled_timeout_ms(driver.next_decision), 1);
+    }
+
+    #[test]
+    fn legacy_idle_cadence_fallback_uses_same_policy_path() {
+        let mut app = app_with_runtime_resources(instant_seconds_ago(2));
+
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity::default(),
+                None,
+                false
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: Duration::from_secs(1),
+                reason: DeadlineReason::IdleWatchdog,
+            })
+        );
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity::default(),
+                None,
+                true,
+            ),
+            RunnerDecision::Wait(WaitDeadline {
+                duration: Duration::from_millis(50),
+                reason: DeadlineReason::IdleWatchdog,
+            })
+        );
+    }
+
+    #[test]
+    fn submillisecond_waits_are_clamped_for_os_scheduling() {
+        assert_eq!(
+            scheduled_timeout_ms(RunnerDecision::Wait(WaitDeadline {
+                duration: Duration::from_micros(500),
+                reason: DeadlineReason::StateSave,
+            })),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_due_deadline_is_clamped_instead_of_spinning() {
+        let mut driver = RuntimeDriver::without_deadline_timer_for_tests();
+        driver.next_decision =
+            RunnerDecision::RunUpdateNow(UpdateReason::DeadlineElapsed(DeadlineReason::StateSave));
+
+        let guarded = driver.guard_repeated_immediate_deadline(RunnerDecision::RunUpdateNow(
+            UpdateReason::DeadlineElapsed(DeadlineReason::StateSave),
+        ));
+
+        assert_eq!(
+            guarded,
+            RunnerDecision::Wait(WaitDeadline {
+                duration: MIN_OS_WAIT_DURATION,
+                reason: DeadlineReason::StateSave,
+            })
+        );
+        assert_eq!(scheduled_timeout_ms(guarded), 1);
+    }
+
+    #[test]
+    fn due_production_deadline_runs_update_now_instead_of_zero_wait() {
+        let mut app = app_with_runtime_resources(Instant::now());
+        app.world_mut()
+            .resource_mut::<RuntimeDeadlines>()
+            .set_after(Duration::ZERO, DeadlineReason::StateSave, Duration::ZERO);
+        let visible_deadline = next_visible_runtime_deadline(app.world_mut());
+
+        assert_eq!(
+            RuntimeDriver::next_decision_after_update(
+                app.world_mut(),
+                LoopActivity::default(),
+                visible_deadline,
+                false,
+            ),
+            RunnerDecision::RunUpdateNow(UpdateReason::DeadlineElapsed(DeadlineReason::StateSave))
+        );
     }
 
     #[test]

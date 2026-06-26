@@ -13,7 +13,8 @@ use crate::events::Event;
 use crate::manager::Window;
 use crate::platform::cf_run_loop_pump_enabled_for_env;
 use crate::runtime_driver::{
-    custom_runtime_driver_enabled_for_env, legacy_idle_cadence_forced_for_env,
+    appkit_blocking_wait_forced_for_env, custom_runtime_driver_enabled_for_env,
+    legacy_idle_cadence_forced_for_env,
 };
 use crate::tests::TestHarness;
 
@@ -120,4 +121,7 @@ fn perf_fallback_knobs_have_documented_defaults() {
 
     assert!(!legacy_idle_cadence_forced_for_env(false));
     assert!(legacy_idle_cadence_forced_for_env(true));
+
+    assert!(!appkit_blocking_wait_forced_for_env(false));
+    assert!(appkit_blocking_wait_forced_for_env(true));
 }
