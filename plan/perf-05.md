@@ -7,6 +7,21 @@ large or risky. Manager feedback agrees that we should preserve the robust legac
 50 ms cadence while reducing per-tick cost, rather than tuning longer sleeps
 inside `pump_events`.
 
+## Implementation status on this branch
+
+In progress / needs manual measurement.
+
+The branch now keeps the legacy Cocoa pump and idle timeout behavior by default,
+and sets Paneru's Bevy schedules to `ExecutorKind::SingleThreaded` by default.
+Use this fallback to compare against Bevy's multi-threaded executor:
+
+```sh
+PANERU_MULTI_THREADED_SCHEDULES=1 paneru
+```
+
+Do not mark this ticket done until idle measurements and manual responsiveness
+checks are recorded.
+
 ## Goal
 Determine whether Bevy’s multi-threaded executor is responsible for meaningful idle overhead and switch to single-threaded execution if it improves efficiency without hurting responsiveness.
 

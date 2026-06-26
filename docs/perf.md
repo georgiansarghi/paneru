@@ -79,6 +79,21 @@ The ordering is intentional: event first, wake second. If the receiver is gone,
 background-thread wake signalling, disconnected receiver behavior, and burst
 send delivery.
 
+## Single-threaded schedule experiment
+
+perf-05 keeps the known-responsive legacy Cocoa pump / ~50 ms idle cadence and
+switches Paneru's Bevy schedules to the single-threaded executor by default. The
+intent is to reduce scheduler/worker overhead without changing wake timing.
+
+Fallback while testing:
+
+```sh
+PANERU_MULTI_THREADED_SCHEDULES=1 paneru
+```
+
+Use `scripts/profile-idle.sh` to compare idle CPU, thread activity, wakeups, and
+`paneru query active` latency with and without the fallback.
+
 ## Computed idle deadline experiment
 
 perf-04 is in spike mode and is not considered shippable. See
@@ -90,20 +105,15 @@ latency because AppKit's `nextEventMatchingMask` wait did not reliably return
 when non-NSEvent run-loop sources (CGEventTap/AX callbacks) enqueued Paneru
 internal events.
 
-The current spike drives the main run loop with `CFRunLoopRunInMode(...,
-returnAfterSourceHandled = true)`, then drains already-pending AppKit events
-without blocking. A temporary fallback is available:
+The CFRunLoop pump / computed-deadline spike is now opt-in only because manual
+testing found it still introduced variable latency:
 
 ```sh
-PANERU_LEGACY_COCOA_PUMP=1 paneru
+PANERU_CF_RUN_LOOP_PUMP=1 paneru
 ```
 
-Deadline policy in spike mode:
-
-- active repositioning/resizing/scrolling/flash messages: 16 ms frame deadline;
-- pending Bevy `Timeout` components: sleep no longer than the next timer;
-- otherwise idle: 100 ms safety watchdog deadline during the spike;
-- low power idle: 500 ms watchdog deadline.
+Default runtime behavior preserves the legacy AppKit pump and idle timeout ramp
+while perf-05 tests per-tick cost reductions.
 
 ## Interpreting results
 

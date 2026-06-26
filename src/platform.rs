@@ -234,26 +234,20 @@ impl PlatformCallbacks {
     }
 
     pub fn pump_cocoa_event_loop(&mut self, timeout: f64) {
-        if legacy_cocoa_pump_enabled() {
-            self.pump_cocoa_event_loop_legacy(timeout);
+        if cf_run_loop_pump_enabled() {
+            self.pump_cocoa_event_loop_cf_run_loop(timeout);
         } else {
-            self.pump_cocoa_event_loop_wakeable(timeout);
+            self.pump_cocoa_event_loop_legacy(timeout);
         }
     }
 
-    fn pump_cocoa_event_loop_wakeable(&mut self, timeout: f64) {
+    fn pump_cocoa_event_loop_cf_run_loop(&mut self, timeout: f64) {
         autoreleasepool(|_| {
-            // Spike for perf-04: let any CFRunLoop source wake the main loop,
-            // not only AppKit NSEvents. CGEventTap/AX callbacks can enqueue
-            // Paneru internal events without producing a dequeued NSEvent; the
-            // legacy `nextEventMatchingMask:untilDate:` wait can then sit until
-            // the full timeout. CFRunLoopRunInMode(..., returnAfterSource=true)
-            // returns as soon as those sources are handled.
+            // Experimental perf-04 path. Keep this opt-in: manual testing showed
+            // lower-wakeup long-idle attempts still had shortcut latency unless
+            // the legacy AppKit pump/cadence was preserved.
             CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, timeout, true);
 
-            // Process AppKit events that are already pending, but do not block
-            // here. Blocking is handled by CFRunLoopRunInMode above so callback
-            // sources and posted AppKit events share one wake point.
             let now = NSDate::dateWithTimeIntervalSinceNow(0.0);
             while let Some(event) = unsafe {
                 self.cocoa_app
@@ -296,9 +290,9 @@ impl PlatformCallbacks {
     }
 }
 
-fn legacy_cocoa_pump_enabled() -> bool {
+fn cf_run_loop_pump_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PANERU_LEGACY_COCOA_PUMP").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("PANERU_CF_RUN_LOOP_PUMP").is_some())
 }
 
 impl Modifiers {

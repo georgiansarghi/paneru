@@ -18,7 +18,7 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
 use crate::ecs::{
     BProcess, ExistingMarker, FocusFollowsMouse, Initializing, MissionControlActive, SkipReshuffle,
-    SpawnWindowTrigger, register_systems, register_triggers,
+    SpawnWindowTrigger, configure_schedule_executors, register_systems, register_triggers,
 };
 use crate::events::Event;
 use crate::manager::{Window, WindowManager};
@@ -234,6 +234,8 @@ fn setup_world() -> App {
         .add_plugins(FocusEventsPlugin)
         .add_plugins(DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
+
+    configure_schedule_executors(&mut bevy_app);
 
     bevy_app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
         100,

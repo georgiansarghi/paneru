@@ -106,20 +106,21 @@ coordinated properly with Bevy updates.
 
 ### Attempt 4: CFRunLoopRunInMode spike
 
-Current branch state. The Cocoa pump now has a spike path using:
+Retained as an opt-in experiment, not the default. The Cocoa pump has a spike path using:
 
 ```text
 CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, returnAfterSourceHandled=true)
 ```
 
-Then it drains pending AppKit events without blocking. A fallback remains:
+Then it drains pending AppKit events without blocking. It can be enabled with:
 
 ```sh
-PANERU_LEGACY_COCOA_PUMP=1 paneru
+PANERU_CF_RUN_LOOP_PUMP=1 paneru
 ```
 
-Idle deadline in this spike was reduced to 100 ms after 250 ms still showed
-noticeable lag.
+The default path was restored to the legacy AppKit pump / 50 ms idle ramp before
+starting perf-05. Idle deadline in this spike was reduced to 100 ms after 250 ms
+still showed noticeable lag.
 
 Result: **better than previous attempts but still not good enough**.
 
