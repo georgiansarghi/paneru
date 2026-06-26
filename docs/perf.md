@@ -92,7 +92,9 @@ PANERU_MULTI_THREADED_SCHEDULES=1 paneru
 ```
 
 Use `scripts/profile-idle.sh` to compare idle CPU, thread activity, wakeups, and
-`paneru query active` latency with and without the fallback.
+`paneru query active` latency with and without the fallback. This experiment also
+throttles the expensive native-tab reconciliation pass to 250 ms while preserving
+the legacy input/animation cadence.
 
 ## Computed idle deadline experiment
 
