@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use bevy::app::{App, Plugin, PostUpdate};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
@@ -11,7 +8,7 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, Single};
 use bevy::prelude::Event as BevyEvent;
-use bevy::time::common_conditions::on_timer;
+use std::collections::HashMap;
 use tracing::{Level, debug, error, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
@@ -25,8 +22,7 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::WorkspaceId;
-
-const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
+use crate::runtime_driver::DeadlineReason;
 
 #[derive(Default)]
 pub struct TierMemory {
@@ -96,9 +92,9 @@ impl Plugin for FocusEventsPlugin {
             (
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
                 mouse_follows_focus.after(super::systems::animate_resize_entities),
-                recover_lost_focus.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
+                recover_lost_focus.run_if(super::runtime_deadline_due(
+                    DeadlineReason::LostFocusWatchdog,
+                )),
             ),
         );
         app.add_observer(dim_remove_window_trigger)
