@@ -38,7 +38,7 @@ use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 use crate::runtime_driver::{
-    DeadlineReason, RuntimeActivity, RuntimeDeadlineClock, RuntimeDeadlines,
+    DeadlineReason, RuntimeActivity, RuntimeDeadlineClock, RuntimeDeadlines, RuntimeDriverActive,
 };
 
 pub mod display;
@@ -68,14 +68,25 @@ pub(crate) fn native_tab_reconcile_period() -> Duration {
     Duration::from_millis(NATIVE_TAB_RECONCILE_MS)
 }
 
+#[allow(clippy::type_complexity)]
 fn runtime_deadline_due(
     reason: DeadlineReason,
-) -> impl FnMut(Option<Res<RuntimeDeadlineClock>>, Option<Res<RuntimeDeadlines>>) -> bool + Clone {
-    move |clock: Option<Res<RuntimeDeadlineClock>>, deadlines: Option<Res<RuntimeDeadlines>>| {
-        cfg!(test)
-            || clock
-                .zip(deadlines)
-                .is_some_and(|(clock, deadlines)| deadlines.due(clock.now(), reason))
+) -> impl FnMut(
+    Option<Res<RuntimeDriverActive>>,
+    Option<Res<RuntimeDeadlineClock>>,
+    Option<Res<RuntimeDeadlines>>,
+) -> bool
++ Clone {
+    move |driver_active: Option<Res<RuntimeDriverActive>>,
+          clock: Option<Res<RuntimeDeadlineClock>>,
+          deadlines: Option<Res<RuntimeDeadlines>>| {
+        if driver_active.is_none() {
+            return true;
+        }
+
+        clock
+            .zip(deadlines)
+            .is_some_and(|(clock, deadlines)| deadlines.due(clock.now(), reason))
     }
 }
 
