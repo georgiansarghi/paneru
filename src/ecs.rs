@@ -4,23 +4,24 @@ use serde::Serialize;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{PostUpdate, PreUpdate, Startup};
+use bevy::app::{
+    First, FixedFirst, FixedLast, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Last, PostStartup,
+    PostUpdate, PreStartup, PreUpdate, SpawnScene, Startup, Update,
+};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::Messages;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
+use bevy::ecs::schedule::ExecutorKind;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
+use bevy::ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
 use bevy::time::common_conditions::on_timer;
 use bevy::time::{Time, Virtual};
-use bevy::{
-    app::Update,
-    ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
-};
 use derive_more::{Deref, DerefMut};
 use tracing::{Level, instrument};
 
@@ -168,6 +169,36 @@ pub fn register_systems(app: &mut bevy::app::App) {
 }
 
 /// Registers all the event triggers for the window manager.
+pub fn configure_schedule_executors(app: &mut bevy::app::App) {
+    if !single_threaded_schedules_enabled() {
+        return;
+    }
+
+    app.edit_schedule(PreStartup, single_threaded)
+        .edit_schedule(Startup, single_threaded)
+        .edit_schedule(PostStartup, single_threaded)
+        .edit_schedule(First, single_threaded)
+        .edit_schedule(PreUpdate, single_threaded)
+        .edit_schedule(Update, single_threaded)
+        .edit_schedule(SpawnScene, single_threaded)
+        .edit_schedule(PostUpdate, single_threaded)
+        .edit_schedule(Last, single_threaded)
+        .edit_schedule(FixedFirst, single_threaded)
+        .edit_schedule(FixedPreUpdate, single_threaded)
+        .edit_schedule(FixedUpdate, single_threaded)
+        .edit_schedule(FixedPostUpdate, single_threaded)
+        .edit_schedule(FixedLast, single_threaded);
+}
+
+fn single_threaded(schedule: &mut bevy::ecs::schedule::Schedule) {
+    schedule.set_executor_kind(ExecutorKind::SingleThreaded);
+}
+
+fn single_threaded_schedules_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PANERU_MULTI_THREADED_SCHEDULES").is_none())
+}
+
 pub fn register_triggers(app: &mut bevy::app::App) {
     app.add_systems(
         Update,
@@ -639,6 +670,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: WakeableEventQueue) -> Resu
         .add_plugins(focus::FocusEventsPlugin)
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
+
+    configure_schedule_executors(&mut app);
 
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;

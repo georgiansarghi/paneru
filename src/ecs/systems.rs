@@ -41,53 +41,18 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{PlatformCallbacks, WinID};
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
-const LOOP_FRAME_DEADLINE_MS: u32 = 16;
-const LOOP_IDLE_WATCHDOG_DEADLINE_MS: u32 = 100;
-const LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS: u32 = 500;
+const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
+const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 500;
+const LOOP_MAX_TIMEOUT_MS: u32 = 50;
 const LOOP_TIMEOUT_STEP: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoopDeadline {
-    pub timeout_ms: u32,
-    pub limit_ms: u32,
-    pub reason: LoopWakeReason,
-}
-
-pub(crate) fn loop_deadline(
-    activity: LoopActivity,
-    next_timer_remaining: Option<Duration>,
-) -> LoopDeadline {
-    let (limit_ms, reason) = if activity.frame_active() {
-        (LOOP_FRAME_DEADLINE_MS, classify_timeout_wake(activity))
+pub(crate) const fn loop_timeout_limit_ms(activity: LoopActivity) -> u32 {
+    if activity.frame_active() {
+        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
     } else if activity.low_power {
-        (
-            LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS,
-            LoopWakeReason::TimeoutWatchdog,
-        )
+        LOOP_MAX_TIMEOUT_LOWPOWER_MS
     } else {
-        (
-            LOOP_IDLE_WATCHDOG_DEADLINE_MS,
-            LoopWakeReason::TimeoutWatchdog,
-        )
-    };
-
-    let timeout_ms = next_timer_remaining
-        .map(duration_to_timeout_ms)
-        .map_or(limit_ms, |timer_ms| timer_ms.min(limit_ms));
-
-    LoopDeadline {
-        timeout_ms,
-        limit_ms,
-        reason,
-    }
-}
-
-fn duration_to_timeout_ms(duration: Duration) -> u32 {
-    let millis = duration.as_millis();
-    if millis == 0 {
-        LOOP_TIMEOUT_STEP
-    } else {
-        millis.min(u128::from(u32::MAX)) as u32
+        LOOP_MAX_TIMEOUT_MS
     }
 }
 
@@ -635,7 +600,6 @@ pub(super) fn pump_events(
     resizing: Query<(), With<ResizeMarker>>,
     scrolling: Query<(), With<Scrolling>>,
     flash_messages: Query<(), With<FlashMessage>>,
-    timeouts: Query<&Timeout>,
     mut timeout: Local<u32>,
     mut diagnostics: Option<ResMut<LoopDiagnostics>>,
 ) {
@@ -682,20 +646,13 @@ pub(super) fn pump_events(
                     flash_message: !flash_messages.is_empty(),
                     low_power: low_power_mode.is_some_and(|low_power| low_power.0),
                 };
-                let next_timer_remaining = timeouts
-                    .iter()
-                    .map(|timeout| timeout.timer.remaining())
-                    .min();
-                let deadline = loop_deadline(activity, next_timer_remaining);
+                let timeout_limit = loop_timeout_limit_ms(activity);
+                let next_timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
                 if let Some(diagnostics) = diagnostics.as_mut() {
-                    diagnostics.record(deadline.reason);
-                    diagnostics.record_timeout_policy(
-                        activity,
-                        deadline.timeout_ms,
-                        deadline.limit_ms,
-                    );
+                    diagnostics.record(classify_timeout_wake(activity));
+                    diagnostics.record_timeout_policy(activity, next_timeout, timeout_limit);
                 }
-                *timeout = deadline.timeout_ms;
+                *timeout = next_timeout;
                 break;
             }
         }
@@ -1659,7 +1616,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deadline_policy_uses_frame_deadline_for_active_work() {
+    fn timeout_policy_uses_frame_deadline_for_active_work() {
         for activity in [
             LoopActivity {
                 repositioning: true,
@@ -1679,50 +1636,26 @@ mod tests {
                 ..LoopActivity::default()
             },
         ] {
-            let deadline = loop_deadline(activity, None);
-            assert_eq!(deadline.timeout_ms, LOOP_FRAME_DEADLINE_MS);
-            assert_eq!(deadline.limit_ms, LOOP_FRAME_DEADLINE_MS);
+            assert_eq!(
+                loop_timeout_limit_ms(activity),
+                LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+            );
         }
     }
 
     #[test]
-    fn deadline_policy_uses_longer_idle_watchdog_than_legacy_polling() {
-        let deadline = loop_deadline(LoopActivity::default(), None);
-
-        assert_eq!(deadline.timeout_ms, LOOP_IDLE_WATCHDOG_DEADLINE_MS);
-        assert!(deadline.timeout_ms > 50);
-        assert_eq!(deadline.reason, LoopWakeReason::TimeoutWatchdog);
-    }
-
-    #[test]
-    fn deadline_policy_distinguishes_low_power() {
-        let deadline = loop_deadline(
-            LoopActivity {
+    fn timeout_policy_distinguishes_idle_and_low_power() {
+        assert_eq!(
+            loop_timeout_limit_ms(LoopActivity::default()),
+            LOOP_MAX_TIMEOUT_MS
+        );
+        assert_eq!(
+            loop_timeout_limit_ms(LoopActivity {
                 low_power: true,
                 ..LoopActivity::default()
-            },
-            None,
+            }),
+            LOOP_MAX_TIMEOUT_LOWPOWER_MS
         );
-
-        assert_eq!(
-            deadline.timeout_ms,
-            LOOP_LOW_POWER_IDLE_WATCHDOG_DEADLINE_MS
-        );
-    }
-
-    #[test]
-    fn deadline_policy_never_sleeps_past_pending_timeout() {
-        let deadline = loop_deadline(LoopActivity::default(), Some(Duration::from_millis(75)));
-
-        assert_eq!(deadline.timeout_ms, 75);
-        assert_eq!(deadline.limit_ms, LOOP_IDLE_WATCHDOG_DEADLINE_MS);
-    }
-
-    #[test]
-    fn deadline_policy_clamps_finished_timeout_to_one_millisecond() {
-        let deadline = loop_deadline(LoopActivity::default(), Some(Duration::ZERO));
-
-        assert_eq!(deadline.timeout_ms, LOOP_TIMEOUT_STEP);
     }
 
     #[test]
@@ -1760,7 +1693,7 @@ mod tests {
                 ..LoopActivity::default()
             },
             4,
-            LOOP_FRAME_DEADLINE_MS,
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS,
         );
 
         assert_eq!(diagnostics.counters.cocoa_event_pump, 1);
@@ -1768,6 +1701,9 @@ mod tests {
         assert_eq!(diagnostics.counters.frame_active, 1);
         assert!(diagnostics.last_activity.scrolling);
         assert_eq!(diagnostics.last_timeout_ms, 4);
-        assert_eq!(diagnostics.last_timeout_limit_ms, LOOP_FRAME_DEADLINE_MS);
+        assert_eq!(
+            diagnostics.last_timeout_limit_ms,
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
     }
 }
