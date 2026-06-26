@@ -2,6 +2,7 @@ mod display;
 mod harness;
 mod interaction;
 mod mocks;
+mod perf;
 mod session_restore;
 mod state;
 mod tabs;
