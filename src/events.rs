@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -296,6 +296,15 @@ impl WakeableEventQueue {
 
     pub fn recv_timeout(&self, timeout: Duration) -> std::result::Result<Event, RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
+    }
+
+    pub fn try_recv(&self) -> std::result::Result<Event, TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_receiver(rx: Receiver<Event>) -> Self {
+        Self { rx }
     }
 }
 
