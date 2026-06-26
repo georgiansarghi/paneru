@@ -51,6 +51,18 @@ mod systems;
 mod triggers;
 pub mod workspace;
 
+pub(crate) const NATIVE_TAB_RECONCILE_MS: u64 = 250;
+
+pub(crate) const fn single_threaded_schedules_enabled_for_env(
+    multi_threaded_env_present: bool,
+) -> bool {
+    !multi_threaded_env_present
+}
+
+pub(crate) fn native_tab_reconcile_period() -> Duration {
+    Duration::from_millis(NATIVE_TAB_RECONCILE_MS)
+}
+
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
 /// process/application/window lifecycle management, animation, and periodic watchers.
@@ -61,7 +73,6 @@ pub mod workspace;
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
-    const NATIVE_TAB_RECONCILE_MS: u64 = 250;
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -164,7 +175,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::reconcile_tabbed_windows
                 .run_if(native_tabs_enabled)
                 .run_if(not_swiping)
-                .run_if(on_timer(Duration::from_millis(NATIVE_TAB_RECONCILE_MS))),
+                .run_if(on_timer(native_tab_reconcile_period())),
             crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
         ),
     );
@@ -198,7 +209,11 @@ fn single_threaded(schedule: &mut bevy::ecs::schedule::Schedule) {
 
 fn single_threaded_schedules_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PANERU_MULTI_THREADED_SCHEDULES").is_none())
+    *ENABLED.get_or_init(|| {
+        single_threaded_schedules_enabled_for_env(
+            std::env::var_os("PANERU_MULTI_THREADED_SCHEDULES").is_some(),
+        )
+    })
 }
 
 pub fn register_triggers(app: &mut bevy::app::App) {

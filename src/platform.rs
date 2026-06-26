@@ -290,9 +290,15 @@ impl PlatformCallbacks {
     }
 }
 
+pub(crate) const fn cf_run_loop_pump_enabled_for_env(cf_pump_env_present: bool) -> bool {
+    cf_pump_env_present
+}
+
 fn cf_run_loop_pump_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PANERU_CF_RUN_LOOP_PUMP").is_some())
+    *ENABLED.get_or_init(|| {
+        cf_run_loop_pump_enabled_for_env(std::env::var_os("PANERU_CF_RUN_LOOP_PUMP").is_some())
+    })
 }
 
 impl Modifiers {
