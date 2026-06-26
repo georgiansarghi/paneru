@@ -9,18 +9,28 @@ inside `pump_events`.
 
 ## Implementation status on this branch
 
-In progress / needs manual measurement.
+Done as a conservative per-tick-cost optimization.
 
-The branch now keeps the legacy Cocoa pump and idle timeout behavior by default,
-and sets Paneru's Bevy schedules to `ExecutorKind::SingleThreaded` by default.
-Use this fallback to compare against Bevy's multi-threaded executor:
+The branch keeps the legacy Cocoa pump and idle timeout behavior by default,
+sets Paneru's Bevy schedules to `ExecutorKind::SingleThreaded` by default, and
+throttles the expensive native-tab reconciliation pass to 250 ms.
+
+Fallbacks/experiments:
 
 ```sh
 PANERU_MULTI_THREADED_SCHEDULES=1 paneru
+PANERU_CF_RUN_LOOP_PUMP=1 paneru
 ```
 
-Do not mark this ticket done until idle measurements and manual responsiveness
-checks are recorded.
+Manual result: user confirmed responsiveness feels good and native tabs still
+seem to work fine after the throttling change.
+
+Local profile after reload (`perf-runs/perf-05-throttled-single-thread`, not
+committed): `top` reported Paneru at 1.8% CPU at the end of the 30s window;
+`paneru query active` median latency was 11.066 ms, max 25.577 ms. This is a
+large improvement over the prior single-thread-only profile taken before native
+tab throttling, where `top` reported 9.2% at the end of the window and median
+query latency was 19.090 ms.
 
 ## Goal
 Determine whether Bevy’s multi-threaded executor is responsible for meaningful idle overhead and switch to single-threaded execution if it improves efficiency without hurting responsiveness.

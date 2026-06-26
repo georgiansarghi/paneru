@@ -96,6 +96,11 @@ Use `scripts/profile-idle.sh` to compare idle CPU, thread activity, wakeups, and
 throttles the expensive native-tab reconciliation pass to 250 ms while preserving
 the legacy input/animation cadence.
 
+Current local result after manual reload/testing: responsiveness felt good,
+native tabs still worked, and `scripts/profile-idle.sh --out
+perf-runs/perf-05-throttled-single-thread` reported 1.8% Paneru CPU at the end
+of the 30s `top` window with `paneru query active` median latency of 11.066 ms.
+
 ## Computed idle deadline experiment
 
 perf-04 is in spike mode and is not considered shippable. See
