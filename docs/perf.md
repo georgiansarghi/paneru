@@ -166,14 +166,25 @@ lost-focus/orphan/refresh watchdogs, low-power checks, periodic maintenance,
 state save, and timeout components. perf-13 added conservative adaptive idle:
 Paneru keeps the fast legacy cadence for a short grace period after input,
 window/focus/layout/command, or animation activity, then quiet idle may sleep
-until the next runner-visible deadline (capped conservatively). The custom runner
-is on by default and preserves the accepted interactive caps:
+until the next runner-visible deadline (capped conservatively). perf-16 made the
+native-tab reconciliation deadline conditional: native tabs disabled means no
+native-tab deadline; existing tab groups or recent activity keep the 250 ms
+reconciliation cadence; otherwise only a 30 s safety check is registered. perf-18
+made runner-visible `RuntimeDeadlines` the source of truth for critical watchdogs
+and maintenance instead of hidden Bevy `on_timer(...)` state: lost-focus recovery,
+orphan workspace repair, refresh-window-sizes, low-power checks, periodic state
+save, periodic maintenance, and native-tab reconciliation all run when their named
+deadline is due and are then explicitly rescheduled. The custom runner is on by
+default and preserves the accepted interactive caps:
 
 - 16 ms while frame-active work is present;
 - ~50 ms during normal idle / recent interactive activity;
 - 500 ms in low-power mode;
 - quiet idle after the grace window may wait until the next visible deadline,
-  capped at 1000 ms.
+  capped at 1000 ms;
+- when native-tab reconciliation is active, it intentionally constrains the
+  quiet-idle floor to 250 ms; without active/recent native-tab work, other
+  watchdogs are usually the effective floor.
 
 Fallback while testing the runner architecture:
 
@@ -184,6 +195,17 @@ PANERU_LEGACY_IN_SYSTEM_WAIT=1 paneru
 This restores the old shape where `pump_events` performs the blocking wait from
 `PreUpdate`.
 
+Fallback for the perf-17 runner-owned wait primitive:
+
+```sh
+PANERU_APPKIT_BLOCKING_WAIT=1 paneru
+```
+
+This keeps the custom top-level runner but temporarily delegates the wait back to
+the AppKit blocking pump. By default, the custom runner now waits with its own
+CoreFoundation run-loop timer/source boundary and only drains pending AppKit
+NSEvents nonblocking after a wake.
+
 Fallback while testing adaptive idle only:
 
 ```sh
@@ -193,10 +215,73 @@ PANERU_LEGACY_IDLE_CADENCE=1 paneru
 This keeps the custom runner but forces the legacy ~50 ms idle cadence.
 
 Runtime diagnostics include dirty-settle counters, the last dirty reasons, recent
-activity reasons, and the current runner-visible deadline reason/duration. These
-help identify whether a command, internal message, focus/animation change, or
-watchdog requested immediate follow-up work. State queries/subscriptions are
-served in the same update and intentionally do not request dirty follow-up work.
+activity reasons, the current runner-visible deadline reason/duration, the
+native-tab deadline policy (`disabled`, `active_tab_group`, `recent_activity`, or
+`safety_check`), and the last due/rescheduled deadline names. These help identify
+whether a command, internal message, focus/animation change, native-tab
+reconciliation, state save, maintenance, or watchdog requested immediate follow-up
+work. State queries/subscriptions are served in the same update and intentionally
+do not request dirty follow-up work.
+
+### Production rollout checklist
+
+Before treating the custom runner as production-ready on a release branch:
+
+1. Run automated validation:
+   ```sh
+   cargo fmt
+   cargo test
+   cargo clippy --all-targets --all-features -- -D warnings
+   cargo build --release
+   ```
+2. Install and ad-hoc codesign the exact binary the user will reload:
+   ```sh
+   install -m 755 target/release/paneru "$HOME/.local/bin/paneru"
+   codesign --force --sign - "$HOME/.local/bin/paneru"
+   codesign --verify --verbose "$HOME/.local/bin/paneru"
+   "$HOME/.local/bin/paneru" --version
+   ```
+3. Reload Paneru and complete manual macOS checks:
+   - first shortcut/focus/layout response after reload;
+   - first shortcut/focus/layout response after at least 3 s quiet idle;
+   - animation smoothness and scroll/inertia behavior;
+   - Ghostty native tabs via repeated `cmd+t` / `cmd+w`;
+   - sketchybar/focus consistency;
+   - `paneru query active --json`, `paneru query runtime-diagnostics --json`, and
+     subscriber delivery.
+4. Record local profile summaries:
+   ```sh
+   scripts/profile-idle.sh --out perf-runs/<name>-idle --seconds 30 --queries 20
+   scripts/profile-runtime-latency.sh --out perf-runs/<name>-latency \
+     --quiet-seconds 3 --queries 20
+   scripts/profile-runtime-latency.sh --out perf-runs/<name>-latency-command \
+     --quiet-seconds 3 --queries 10 --command-cycles 1 --check-subscribe
+   ```
+5. Confirm runtime diagnostics are stable: dirty-settle guard delta should remain
+   0 during idle/query validation; deadline diagnostics should explain any
+   short quiet-idle floor (for example native-tab reconciliation).
+
+Rollback procedure:
+
+1. Prefer targeted fallbacks first:
+   - `PANERU_APPKIT_BLOCKING_WAIT=1` if the runner-owned CFRunLoop wait causes
+     shortcut/query latency;
+   - `PANERU_LEGACY_IDLE_CADENCE=1` if adaptive quiet idle feels sluggish;
+   - `PANERU_LEGACY_IN_SYSTEM_WAIT=1` if the custom runner itself is suspect.
+2. If behavior is still degraded, reinstall the previous known-good binary,
+   ad-hoc codesign it, and reload with `super+z`.
+3. Treat user-reported sluggishness as a blocking regression even when CPU or
+   wakeup numbers improve.
+
+Known limitations / temporary transition pieces:
+
+- Fallback knobs remain intentionally available until this runner has survived
+  enough real usage. Do not remove them only because local profiling looks good.
+- The old `PANERU_CF_RUN_LOOP_PUMP=1` path is an obsolete, opt-in experiment for
+  comparison only; the production path is now the custom runner's CFRunLoop
+  wait plus nonblocking AppKit event drain.
+- Some AppKit/NSEvent integration still depends on main-thread run-loop behavior;
+  all AppKit/CoreGraphics work must remain on the main thread.
 
 ### Fallback knob summary
 
@@ -204,6 +289,7 @@ served in the same update and intentionally do not request dirty follow-up work.
 | --- | --- | --- | --- |
 | `PANERU_LEGACY_IN_SYSTEM_WAIT=1` | unset | Restores the pre-runner in-system wait path for comparison or emergency fallback. | Remove after the custom legacy-equivalent runner has shipped without responsiveness regressions. |
 | `PANERU_LEGACY_IDLE_CADENCE=1` | unset | Keeps the custom runner but disables adaptive quiet idle, forcing the legacy ~50 ms cadence. | Remove after adaptive idle has shipped with acceptable latency and profile results. |
+| `PANERU_APPKIT_BLOCKING_WAIT=1` | unset | Keeps the custom runner but restores the AppKit blocking wait for rollback while validating the runner-owned CFRunLoop wait. | Remove after runner-owned waiting has shipped without shortcut/query latency regressions. |
 | `PANERU_MULTI_THREADED_SCHEDULES=1` | unset | Restores Bevy's multi-threaded schedule executor for comparison or emergency fallback. | Remove after single-threaded scheduling has shipped across enough macOS/Paneru usage without regressions. |
 | `PANERU_CF_RUN_LOOP_PUMP=1` | unset | Enables the non-shippable CFRunLoop pump/deadline spike. | Remove or replace when a real CFRunLoop source/timer runner supersedes the spike. |
 
@@ -222,7 +308,8 @@ perf-06 added deterministic tests for the risks found during the loop spike:
 Existing perf-03 tests cover external event burst delivery and disconnected
 receiver behavior.
 
-perf-08 through perf-14 added deterministic coverage for the custom runner work:
+perf-08 through perf-19 added deterministic coverage and validation tooling for
+the custom runner work:
 
 - pure runtime policy decisions for external events, dirty Bevy work, active
   animation, shutdown, watchdog deadlines, recent activity, and low-power caps;
@@ -235,7 +322,10 @@ perf-08 through perf-14 added deterministic coverage for the custom runner work:
 - adaptive-idle transitions from active/recent activity to quiet idle without
   sleeping past visible repair deadlines;
 - native-tab close focus handoff to the remaining tab, preventing stale
-  Paneru/sketchybar focus after closing a Ghostty tab.
+  Paneru/sketchybar focus after closing a Ghostty tab;
+- `scripts/profile-runtime-latency.sh` for repeatable quiet-idle query latency,
+  optional safe focus-command latency, optional subscriber delivery, runtime
+  diagnostics, and a quiet-idle `top` sample.
 
 ## PR / handoff summary
 
@@ -254,12 +344,43 @@ perf-08 through perf-14 added deterministic coverage for the custom runner work:
   ramp after internal events; Ghostty native-tab close focus no longer reproduced
   after explicitly focusing the remaining tab; sketchybar focus stayed
   consistent; adaptive idle felt at least as responsive as the legacy cadence.
-- Current profile after the final layout-dirty fix:
+- Current idle profile after the final layout-dirty fix:
   `scripts/profile-idle.sh --out perf-runs/perf-14-final-after-layout-dirty-fix
   --seconds 30 --queries 20` reported Paneru CPU at 2.2% at the end of the 30s
   `top` window and `paneru query active` median latency of 8.045 ms, max 11.557
   ms. The command-line `top` on this macOS version did not expose a wakeups
   column.
+- Current runtime-latency profile after perf-19:
+  `scripts/profile-runtime-latency.sh --out perf-runs/perf-19-current-with-command
+  --quiet-seconds 3 --queries 10 --command-cycles 1 --check-subscribe` reported
+  query median 9.378 ms / max 11.449 ms, safe focus-command median 5.042 ms /
+  max 5.181 ms, subscriber delivery 9.256 ms, and dirty-settle guard delta 0.
+- Current production-rollout idle profile after perf-20:
+  `scripts/profile-idle.sh --out perf-runs/perf-20-current-idle --seconds 30
+  --queries 20` reported Paneru CPU at 0.4% at the end of the 30 s `top` window
+  and `paneru query active` median latency 9.224 ms, max 14.495 ms. Wakeups were
+  unavailable from command-line `top` on this macOS version.
+
+### Runtime latency validation script
+
+Use the installed/codesigned binary after reloading Paneru:
+
+```sh
+scripts/profile-runtime-latency.sh --quiet-seconds 3 --queries 20
+```
+
+For a fuller interactive check that changes focus but does not rearrange windows:
+
+```sh
+scripts/profile-runtime-latency.sh --quiet-seconds 3 --queries 10 \
+  --command-cycles 1 --check-subscribe
+```
+
+The script writes `summary.txt`, `summary.json`, raw latency metrics, runtime
+ diagnostics before/after, active-state snapshots, and `top-quiet.txt` under
+`perf-runs/`. For fallback comparison, prefix the command with
+`PANERU_LEGACY_IDLE_CADENCE=1` or run it after launching Paneru with the desired
+fallback knob.
 
 ## Interpreting results
 
