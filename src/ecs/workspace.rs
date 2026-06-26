@@ -10,9 +10,7 @@ use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
-use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
-use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
@@ -30,14 +28,12 @@ use crate::errors::Result;
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
+use crate::runtime_driver::DeadlineReason;
 
 pub struct WorkspaceEventsPlugin;
 
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
-        const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
-        const DISPLAY_CHANGE_CHECK_FREQ_MS: u64 = 1000;
-
         let reap_workspaces = |config: Option<Res<Config>>| {
             config.is_some_and(|config| config.reap_empty_workspaces())
         };
@@ -56,14 +52,14 @@ impl Plugin for WorkspaceEventsPlugin {
                 show_active_workspace,
                 handle_virtual_window_moves,
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
-                refresh_workspace_window_sizes.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
+                refresh_workspace_window_sizes.run_if(super::runtime_deadline_due(
+                    DeadlineReason::RefreshWindowSizes,
+                )),
                 find_orphaned_workspaces
                     .after(crate::ecs::display::reconcile_displays)
-                    .run_if(on_timer(Duration::from_millis(
-                        DISPLAY_CHANGE_CHECK_FREQ_MS,
-                    ))),
+                    .run_if(super::runtime_deadline_due(
+                        DeadlineReason::OrphanWorkspaceWatchdog,
+                    )),
             ),
         );
         app.add_systems(PostUpdate, workspace_destroyed_handler);

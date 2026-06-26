@@ -20,7 +20,6 @@ use bevy::ecs::{component::Component, entity::Entity, schedule::IntoScheduleConf
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
-use bevy::time::common_conditions::on_timer;
 use bevy::time::{Time, Virtual};
 use derive_more::{Deref, DerefMut};
 use tracing::{Level, instrument};
@@ -38,6 +37,9 @@ use crate::manager::{
 use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
+use crate::runtime_driver::{
+    DeadlineReason, RuntimeActivity, RuntimeDeadlineClock, RuntimeDeadlines,
+};
 
 pub mod display;
 pub mod focus;
@@ -61,8 +63,20 @@ pub(crate) const fn single_threaded_schedules_enabled_for_env(
     !multi_threaded_env_present
 }
 
+#[cfg(test)]
 pub(crate) fn native_tab_reconcile_period() -> Duration {
     Duration::from_millis(NATIVE_TAB_RECONCILE_MS)
+}
+
+fn runtime_deadline_due(
+    reason: DeadlineReason,
+) -> impl FnMut(Option<Res<RuntimeDeadlineClock>>, Option<Res<RuntimeDeadlines>>) -> bool + Clone {
+    move |clock: Option<Res<RuntimeDeadlineClock>>, deadlines: Option<Res<RuntimeDeadlines>>| {
+        cfg!(test)
+            || clock
+                .zip(deadlines)
+                .is_some_and(|(clock, deadlines)| deadlines.due(clock.now(), reason))
+    }
 }
 
 /// Registers the Bevy systems for the `WindowManager`.
@@ -74,7 +88,9 @@ pub(crate) fn native_tab_reconcile_period() -> Duration {
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
+    app.init_resource::<RuntimeDeadlineClock>()
+        .init_resource::<RuntimeDeadlines>()
+        .init_resource::<RuntimeActivity>();
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -137,7 +153,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::retry_front_switch,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
-                .run_if(on_timer(Duration::from_secs(LOW_POWER_MODE_CHECK_SEC))),
+                .run_if(runtime_deadline_due(DeadlineReason::LowPowerWatchdog)),
             (
                 systems::window_resized_update_frame,
                 systems::window_moved_update_frame,
@@ -146,8 +162,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
-            systems::record_periodic_maintenance.run_if(on_timer(Duration::from_secs(300))),
-            state::periodic_state_save.run_if(on_timer(Duration::from_secs(300))),
+            systems::record_periodic_maintenance
+                .run_if(runtime_deadline_due(DeadlineReason::PeriodicMaintenance)),
+            state::periodic_state_save.run_if(runtime_deadline_due(DeadlineReason::StateSave)),
             state::cleanup_on_exit,
         ),
     );
@@ -177,7 +194,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::reconcile_tabbed_windows
                 .run_if(native_tabs_enabled)
                 .run_if(not_swiping)
-                .run_if(on_timer(native_tab_reconcile_period())),
+                .run_if(runtime_deadline_due(
+                    DeadlineReason::NativeTabReconciliation,
+                )),
             crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
         ),
     );
@@ -516,6 +535,9 @@ pub(crate) struct LoopDiagnostics {
     pub last_dirty_reasons: Vec<&'static str>,
     pub last_runner_deadline_reason: Option<&'static str>,
     pub last_runner_deadline_ms: Option<u32>,
+    pub native_tab_deadline_policy: Option<&'static str>,
+    pub last_due_deadline_reasons: Vec<&'static str>,
+    pub last_rescheduled_deadline_reasons: Vec<&'static str>,
     pub recent_runtime_activity: bool,
     pub runtime_activity_reasons: Vec<&'static str>,
 }
@@ -559,6 +581,20 @@ impl LoopDiagnostics {
         self.last_runner_deadline_reason = deadline.map(|deadline| deadline.reason.as_str());
         self.last_runner_deadline_ms =
             deadline.map(|deadline| deadline.duration.as_millis().try_into().unwrap_or(u32::MAX));
+    }
+
+    pub(crate) fn record_native_tab_deadline_policy(&mut self, policy: &'static str) {
+        self.native_tab_deadline_policy = Some(policy);
+    }
+
+    pub(crate) fn record_runtime_deadline_update(
+        &mut self,
+        due: &[crate::runtime_driver::DeadlineReason],
+        rescheduled: &[crate::runtime_driver::DeadlineReason],
+    ) {
+        self.last_due_deadline_reasons = due.iter().map(|reason| reason.as_str()).collect();
+        self.last_rescheduled_deadline_reasons =
+            rescheduled.iter().map(|reason| reason.as_str()).collect();
     }
 
     pub(crate) fn record_runtime_activity(&mut self, activity: (bool, Vec<&'static str>)) {
