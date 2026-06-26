@@ -187,21 +187,22 @@ impl WakeCoalescer {
     }
 }
 
-struct MainRunLoopWaker {
+struct MainRunLoopWakeSource {
     run_loop: CFRetained<CFRunLoop>,
     source: CFRetained<CFRunLoopSource>,
     coalescer: WakeCoalescer,
 }
 
-// The source is registered on the main run loop during construction. Apple
-// documents `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` as callable from other
-// threads; `wake` is the only cross-thread operation performed through this
-// wrapper. Registration and invalidation happen while the owner lives on the
-// main thread in normal Paneru startup/shutdown.
-unsafe impl Send for MainRunLoopWaker {}
-unsafe impl Sync for MainRunLoopWaker {}
+// The source is registered on the main run loop and intentionally lives for the
+// rest of the process. `EventSender` is cloned into background/platform threads,
+// so sender drop must not own source invalidation/removal that could run on an
+// arbitrary final-drop thread. Apple documents `CFRunLoopSourceSignal` and
+// `CFRunLoopWakeUp` as callable from other threads; `wake` is the only
+// cross-thread operation performed through this wrapper.
+unsafe impl Send for MainRunLoopWakeSource {}
+unsafe impl Sync for MainRunLoopWakeSource {}
 
-impl MainRunLoopWaker {
+impl MainRunLoopWakeSource {
     fn new() -> Option<Self> {
         let run_loop = CFRunLoop::main()?;
         let coalescer = WakeCoalescer::default();
@@ -225,23 +226,36 @@ impl MainRunLoopWaker {
             coalescer,
         })
     }
-}
 
-impl Drop for MainRunLoopWaker {
-    fn drop(&mut self) {
-        self.source.invalidate();
-        CFRunLoop::remove_source(&self.run_loop, Some(&self.source), unsafe {
-            kCFRunLoopCommonModes
-        });
-    }
-}
-
-impl EventWaker for MainRunLoopWaker {
     fn wake(&self) {
         if self.coalescer.request_signal() {
             self.source.signal();
         }
         self.run_loop.wake_up();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MainRunLoopWaker {
+    source: &'static MainRunLoopWakeSource,
+}
+
+impl MainRunLoopWaker {
+    fn new() -> Option<Self> {
+        static SOURCE: std::sync::OnceLock<Option<&'static MainRunLoopWakeSource>> =
+            std::sync::OnceLock::new();
+        SOURCE
+            .get_or_init(|| {
+                MainRunLoopWakeSource::new()
+                    .map(|source| Box::leak(Box::new(source)) as &MainRunLoopWakeSource)
+            })
+            .map(|source| Self { source })
+    }
+}
+
+impl EventWaker for MainRunLoopWaker {
+    fn wake(&self) {
+        self.source.wake();
     }
 }
 
@@ -415,6 +429,38 @@ mod tests {
             ));
         }
         assert_eq!(waker.count.load(Ordering::SeqCst), 128);
+    }
+
+    #[derive(Default)]
+    struct FakeProcessLifetimeSource {
+        invalidations: AtomicUsize,
+        wakes: AtomicUsize,
+    }
+
+    struct FakeSignalHandle {
+        source: Arc<FakeProcessLifetimeSource>,
+    }
+
+    impl EventWaker for FakeSignalHandle {
+        fn wake(&self) {
+            self.source.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn sender_drop_on_background_thread_does_not_invalidate_wake_source() {
+        let source = Arc::new(FakeProcessLifetimeSource::default());
+        let waker = Arc::new(FakeSignalHandle {
+            source: source.clone(),
+        });
+        let (sender, receiver) = EventSender::new_with_waker(waker);
+        let sender = sender.clone();
+
+        thread::spawn(move || drop(sender)).join().unwrap();
+        drop(receiver);
+
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 0);
+        assert_eq!(source.wakes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
