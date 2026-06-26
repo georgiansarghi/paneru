@@ -3,49 +3,60 @@
 This document is the repeatable baseline workflow for the perf tickets in
 `plan/`. It intentionally does not require paid tooling.
 
-## Current pre-optimization baseline
+## Current default architecture
 
-Before the event-driven loop changes, Paneru's runtime loop is polling-oriented:
+Paneru now uses a custom top-level Bevy runner as the default runtime loop:
 
-- `src/ecs/systems.rs` uses a normal idle cap of `LOOP_MAX_TIMEOUT_MS = 50` ms.
-- frame-active work uses `LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS = 16` ms.
-- low-power mode uses `LOOP_MAX_TIMEOUT_LOWPOWER_MS = 500` ms.
+```text
+custom runner:
+  wait on runner-owned CFRunLoop source/timer
+  drain pending AppKit/NSEvent work nonblocking
+  drain queued Paneru events nonblocking
+  run Bevy update
+  run immediate follow-up updates while Bevy-internal dirty work is marked
+  compute the next runner-visible deadline
+  wait again
+```
+
+Key properties:
+
+- **Waiting is outside Bevy.** The `pump_events` system returns immediately when
+  `RuntimeDriverActive` is present; the runner owns the wait/update boundary.
+- **External events are wakeable.** `EventSender::send` queues the event first,
+  then signals a process-lifetime main-run-loop `CFRunLoopSource` and wakes the
+  run loop. Sender clones hold only a lightweight signal handle, so background
+  thread drops cannot invalidate/remove the source.
+- **AppKit and Paneru event drains are nonblocking.** Once the runner wait has
+  returned, the drain phase does not add another blocking wait.
+- **Bevy-internal follow-up work is explicit.** `RuntimeDirty` lets systems and
+  triggers request immediate settle updates, guarded by a maximum iteration
+  count to avoid infinite loops.
+- **Critical timers are runner-visible.** `RuntimeDeadlines` is the source of
+  truth for animation frames, native-tab reconciliation, lost-focus recovery,
+  orphan workspace repair, refresh-window-sizes, low-power checks, state save,
+  periodic maintenance, and timeout components.
+- **Adaptive idle is conservative.** Frame-active work keeps a 16 ms cadence;
+  recent interactive activity keeps the accepted ~50 ms cap; quiet idle may wait
+  longer but never past the next visible repair/maintenance deadline.
+- **Fallback knobs remain available.** The legacy in-system wait, AppKit blocking
+  wait, legacy idle cadence, and multi-threaded schedules can all be restored for
+  comparison or rollback.
+
+## Historical baseline and experiments
+
+Before the custom runner, Paneru's runtime loop was polling-oriented:
+
+- `src/ecs/systems.rs` used a normal idle cap of `LOOP_MAX_TIMEOUT_MS = 50` ms.
+- frame-active work used `LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS = 16` ms.
+- low-power mode used `LOOP_MAX_TIMEOUT_LOWPOWER_MS = 500` ms.
 - AppKit/AX run-loop sources, command socket events, config polling, and Bevy
-  schedule execution are serviced from that loop.
+  schedule execution were serviced from `pump_events` inside Bevy `PreUpdate`.
 
-That means an otherwise idle daemon is expected to wake regularly, roughly on a
-50 ms cadence (about 20 idle wake opportunities per second) before additional
-macOS/AX/config events are considered.
-
-## Current architecture after perf-01 through perf-06
-
-The current shippable branch intentionally keeps the responsive legacy wait
-model, but reduces per-tick cost:
-
-- **Legacy Cocoa/AppKit pump retained by default.** `pump_events` still runs at
-  the start of Bevy `PreUpdate` and pumps AppKit with the established timeout
-  ramp. This preserves shortcut and animation responsiveness.
-- **Idle watchdog polling is intentional.** The ~50 ms idle cap is not an
-  accidental busy loop; it is the current safety mechanism that prevents missed
-  macOS/AppKit/AX wakeups or Bevy-internal follow-up work from becoming visible
-  latency. Low-power mode keeps the previous 500 ms cap.
-- **Frame-active work stays fast.** Active repositioning, resizing, scrolling,
-  and flash messages keep the 16 ms frame cap.
-- **External events are wakeable.** `EventSender::send` queues the event and then
-  wakes the main run loop with `CFRunLoopWakeUp`; this is a prerequisite for a
-  future custom runner, but not relied on as the only responsiveness mechanism.
-- **Bevy schedules are single-threaded by default.** Paneru's schedules use
-  `ExecutorKind::SingleThreaded` to avoid multi-thread scheduler/worker overhead
-  for a mostly main-thread/macOS-bound workload.
-- **Native-tab reconciliation is throttled.** The expensive AX/window-list pass
-  runs every 250 ms instead of every app tick.
-- **Custom top-level runner migration has started.** The default runner now owns
-  the same legacy-equivalent wait cadence outside `pump_events`; it intentionally
-  preserves the 16 ms / ~50 ms / 500 ms caps before any deep-idle policy is
-  attempted.
-
-The tradeoff is explicit: Paneru keeps a moderate idle wake frequency to protect
-command/shortcut latency, while reducing the amount of work done on each wake.
+That legacy model was responsive but woke regularly, roughly on a 50 ms cadence
+while idle. perf-01 through perf-06 reduced per-tick cost and added diagnostics,
+wakeable events, single-threaded schedules, and native-tab throttling. perf-04's
+computed long-idle attempt inside the old wait shape is historical and remains
+non-shippable; see [`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md).
 
 ## One-command local profile
 
@@ -96,17 +107,18 @@ messages, or idle watchdog timeouts. Counters reset when the daemon restarts.
 
 ## Wakeable internal event queue
 
-After perf-03, `EventSender::send` queues the event and then calls
-`CFRunLoopWakeUp` on the main Cocoa run loop. Apple documents this wake function
-as cross-thread safe for waking a target run loop, and Paneru only stores the
-process-lifetime main run-loop pointer. This makes command socket requests,
-queries, config notifications, AX callbacks, and shutdown requests able to wake
-the main loop immediately instead of waiting for a polling timeout.
+`EventSender::send` queues the event and then signals a process-lifetime
+`CFRunLoopSource` registered on the main run loop, followed by `CFRunLoopWakeUp`.
+Apple documents source signalling and run-loop wakeup as cross-thread safe; no
+Bevy/AppKit work happens in the source callback. This makes command socket
+requests, queries, config notifications, AX callbacks, and shutdown requests able
+to wake the custom runner immediately instead of waiting for a polling timeout.
 
 The ordering is intentional: event first, wake second. If the receiver is gone,
 `send` returns an error and does not signal a wake. Unit tests cover successful
-background-thread wake signalling, disconnected receiver behavior, and burst
-send delivery.
+background-thread wake signalling, disconnected receiver behavior, burst send
+delivery, wake coalescing, and background-thread sender drops that must not own
+run-loop source cleanup.
 
 ## Rollout controls and experiments
 
@@ -150,8 +162,8 @@ testing found it still introduced variable latency:
 PANERU_CF_RUN_LOOP_PUMP=1 paneru
 ```
 
-Default runtime behavior preserves the legacy AppKit pump and idle timeout ramp
-while perf-05 tests per-tick cost reductions.
+Default runtime behavior no longer uses this spike path; the accepted custom
+runner has its own CFRunLoop source/timer wait boundary and nonblocking drains.
 
 ### Custom top-level runner migration
 
@@ -286,9 +298,13 @@ Known limitations / temporary transition pieces:
   enough real usage. Do not remove them only because local profiling looks good.
 - The old `PANERU_CF_RUN_LOOP_PUMP=1` path is an obsolete, opt-in experiment for
   comparison only; the production path is now the custom runner's CFRunLoop
-  wait plus nonblocking AppKit event drain.
+  wait plus nonblocking AppKit/event drains.
 - Some AppKit/NSEvent integration still depends on main-thread run-loop behavior;
   all AppKit/CoreGraphics work must remain on the main thread.
+- For upstream review, prefer splitting or squashing the local perf-plan history
+  into smaller topical changes. The `plan/` tickets are local execution notes and
+  do not need to be included in an upstream PR unless maintainers explicitly want
+  that process documentation.
 
 ### Fallback knob summary
 
@@ -355,22 +371,20 @@ the custom runner work:
   ramp after internal events; Ghostty native-tab close focus no longer reproduced
   after explicitly focusing the remaining tab; sketchybar focus stayed
   consistent; adaptive idle felt at least as responsive as the legacy cadence.
-- Current idle profile after the final layout-dirty fix:
-  `scripts/profile-idle.sh --out perf-runs/perf-14-final-after-layout-dirty-fix
-  --seconds 30 --queries 20` reported Paneru CPU at 2.2% at the end of the 30s
-  `top` window and `paneru query active` median latency of 8.045 ms, max 11.557
-  ms. The command-line `top` on this macOS version did not expose a wakeups
-  column.
-- Current runtime-latency profile after perf-19:
-  `scripts/profile-runtime-latency.sh --out perf-runs/perf-19-current-with-command
-  --quiet-seconds 3 --queries 10 --command-cycles 1 --check-subscribe` reported
-  query median 9.378 ms / max 11.449 ms, safe focus-command median 5.042 ms /
-  max 5.181 ms, subscriber delivery 9.256 ms, and dirty-settle guard delta 0.
-- Current production-rollout idle profile after perf-20:
-  `scripts/profile-idle.sh --out perf-runs/perf-20-current-idle --seconds 30
-  --queries 20` reported Paneru CPU at 0.4% at the end of the 30 s `top` window
-  and `paneru query active` median latency 9.224 ms, max 14.495 ms. Wakeups were
+- Final default idle profile for the custom runner:
+  `scripts/profile-idle.sh --out perf-runs/custom-runner-final --seconds 30
+  --queries 20` reported Paneru CPU at 0.6% at the end of the 30 s `top` window
+  and `paneru query active` median latency 5.776 ms, max 49.761 ms. Wakeups were
   unavailable from command-line `top` on this macOS version.
+- Final default runtime-latency profile:
+  `scripts/profile-runtime-latency.sh --out perf-runs/custom-runner-latency
+  --quiet-seconds 3 --queries 20` reported query median 6.036 ms, max 10.312 ms,
+  and dirty-settle guard delta 0.
+- Final default command/subscriber latency profile:
+  `scripts/profile-runtime-latency.sh --out perf-runs/custom-runner-command
+  --quiet-seconds 3 --queries 10 --command-cycles 1 --check-subscribe` reported
+  query median 6.394 ms / max 14.851 ms, safe focus-command median 5.500 ms /
+  max 5.568 ms, subscriber delivery 7.133 ms, and dirty-settle guard delta 0.
 
 ### Runtime latency validation script
 
