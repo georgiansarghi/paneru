@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use bevy::app::{App, AppExit, PluginsState};
@@ -794,8 +794,8 @@ fn drain_external_events(world: &mut World) -> bool {
     let mut exit_requested = false;
     let mut internal_events = 0;
     loop {
-        match incoming_events.recv_timeout(Duration::from_millis(1)) {
-            Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected) => {
+        match incoming_events.try_recv() {
+            Ok(Event::Exit) | Err(TryRecvError::Disconnected) => {
                 internal_events += 1;
                 exit_requested = true;
                 break;
@@ -809,7 +809,7 @@ fn drain_external_events(world: &mut World) -> bool {
                     received_events.push(event);
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Err(TryRecvError::Empty) => {
                 received_events.extend(pending_mouse.take());
                 break;
             }
@@ -1447,10 +1447,103 @@ mod tests {
         app
     }
 
+    fn app_with_external_event_queue(events: Vec<Event>) -> App {
+        app_with_external_event_queue_connected(events, true)
+    }
+
+    fn app_with_external_event_queue_connected(events: Vec<Event>, keep_connected: bool) -> App {
+        let mut app = App::new();
+        app.init_resource::<bevy::ecs::message::Messages<Event>>();
+        app.init_resource::<bevy::ecs::message::Messages<AppExit>>();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for event in events {
+            tx.send(event).expect("test receiver should still be alive");
+        }
+        if keep_connected {
+            std::mem::forget(tx);
+        }
+        app.world_mut()
+            .insert_non_send_resource(WakeableEventQueue::from_receiver(rx));
+        app
+    }
+
+    fn drained_events(app: &mut App) -> Vec<Event> {
+        app.world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<Event>>()
+            .drain()
+            .collect()
+    }
+
     fn instant_seconds_ago(seconds: u64) -> Instant {
         Instant::now()
             .checked_sub(Duration::from_secs(seconds))
             .expect("test duration should be representable")
+    }
+
+    #[test]
+    fn custom_runner_drain_empty_queue_returns_immediately() {
+        let mut app = app_with_external_event_queue(Vec::new());
+
+        assert!(!drain_external_events(app.world_mut()));
+        assert!(drained_events(&mut app).is_empty());
+    }
+
+    #[test]
+    fn custom_runner_drain_collects_burst_without_blocking() {
+        let mut app = app_with_external_event_queue(vec![
+            Event::ProcessesLoaded,
+            Event::ApplicationActivated,
+            Event::ApplicationDeactivated,
+        ]);
+
+        assert!(drain_external_events(app.world_mut()));
+        let events = drained_events(&mut app);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], Event::ProcessesLoaded));
+        assert!(matches!(events[1], Event::ApplicationActivated));
+        assert!(matches!(events[2], Event::ApplicationDeactivated));
+    }
+
+    #[test]
+    fn custom_runner_drain_coalesces_mouse_moves() {
+        let mut app = app_with_external_event_queue(vec![
+            Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(1.0, 1.0),
+                modifiers: crate::platform::Modifiers::empty(),
+            },
+            Event::MouseMoved {
+                point: objc2_core_foundation::CGPoint::new(2.0, 2.0),
+                modifiers: crate::platform::Modifiers::empty(),
+            },
+            Event::ApplicationActivated,
+        ]);
+
+        assert!(drain_external_events(app.world_mut()));
+        let events = drained_events(&mut app);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            Event::MouseMoved { point, .. } if (point.x - 2.0).abs() < f64::EPSILON
+                && (point.y - 2.0).abs() < f64::EPSILON
+        ));
+        assert!(matches!(events[1], Event::ApplicationActivated));
+    }
+
+    #[test]
+    fn custom_runner_drain_exit_and_disconnect_request_shutdown() {
+        for (events, connected) in [(vec![Event::Exit], true), (Vec::new(), false)] {
+            let mut app = app_with_external_event_queue_connected(events, connected);
+
+            assert!(drain_external_events(app.world_mut()));
+            let exits = app
+                .world_mut()
+                .resource_mut::<bevy::ecs::message::Messages<AppExit>>()
+                .drain()
+                .collect::<Vec<_>>();
+            assert_eq!(exits, vec![AppExit::Success]);
+        }
     }
 
     #[test]
