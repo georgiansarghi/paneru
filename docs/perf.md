@@ -81,10 +81,14 @@ send delivery.
 
 ## Computed idle deadline experiment
 
-perf-04 is in spike mode. Earlier long-idle-deadline attempts caused visible
-shortcut and animation latency because AppKit's `nextEventMatchingMask` wait did
-not reliably return when non-NSEvent run-loop sources (CGEventTap/AX callbacks)
-enqueued Paneru internal events.
+perf-04 is in spike mode and is not considered shippable. See
+[`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md) for the detailed
+attempt log and recommendations.
+
+Earlier long-idle-deadline attempts caused visible shortcut and animation
+latency because AppKit's `nextEventMatchingMask` wait did not reliably return
+when non-NSEvent run-loop sources (CGEventTap/AX callbacks) enqueued Paneru
+internal events.
 
 The current spike drives the main run loop with `CFRunLoopRunInMode(...,
 returnAfterSourceHandled = true)`, then drains already-pending AppKit events

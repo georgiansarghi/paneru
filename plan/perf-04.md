@@ -1,5 +1,18 @@
 # perf-04: Replace fixed idle polling with computed deadlines
 
+## Spike status on `perf-loop-spike`
+
+Not done / not shippable.
+
+Multiple computed-deadline attempts were implemented and manually tested. Longer
+idle sleeps reduced expected wakeups but introduced visible, variable shortcut
+and animation latency. The current branch preserves the latest spike for review,
+including a `PANERU_LEGACY_COCOA_PUMP=1` fallback, but perf-04 should not be
+considered accepted.
+
+See `docs/perf-loop-spike-handoff.md` for the detailed attempt log, observed
+failures, current hypothesis, and suggested next approaches.
+
 ## Goal
 Reduce idle CPU by running Paneru only when there is work or when a known deadline is due, while preserving watchdog robustness.
 
