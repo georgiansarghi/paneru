@@ -179,8 +179,10 @@ ownership: the main `CFRunLoopSource` is process-lifetime by design, while
 `EventSender` clones hold only a lightweight signal handle so final-drop cleanup
 cannot run source invalidation/removal from a background thread. Native-tab reconciliation
 preserves an already-scheduled earlier deadline so repeated tab/window activity
-cannot postpone the 250 ms repair pass indefinitely. The custom runner is on by
-default and preserves the accepted interactive caps:
+cannot postpone the 250 ms repair pass indefinitely. perf-22 made the custom
+runner's external-event drain fully nonblocking (`try_recv` until empty) because
+the runner wait has already happened. The custom runner is on by default and
+preserves the accepted interactive caps:
 
 - 16 ms while frame-active work is present;
 - ~50 ms during normal idle / recent interactive activity;
@@ -209,8 +211,7 @@ PANERU_APPKIT_BLOCKING_WAIT=1 paneru
 This keeps the custom top-level runner but temporarily delegates the wait back to
 the AppKit blocking pump. By default, the custom runner now waits with its own
 CoreFoundation run-loop timer/source boundary and drains pending AppKit NSEvents
-nonblocking after a wake. Paneru's external queue still keeps its conservative
-1 ms batching drain while native-tab burst behavior is being hardened.
+and queued Paneru events nonblocking after a wake.
 
 Fallback while testing adaptive idle only:
 
@@ -314,7 +315,7 @@ perf-06 added deterministic tests for the risks found during the loop spike:
 Existing perf-03 tests cover external event burst delivery and disconnected
 receiver behavior.
 
-perf-08 through perf-20 added deterministic coverage and validation tooling for
+perf-08 through perf-22 added deterministic coverage and validation tooling for
 the custom runner work:
 
 - pure runtime policy decisions for external events, dirty Bevy work, active
@@ -329,6 +330,8 @@ the custom runner work:
   sleeping past visible repair deadlines;
 - native-tab close focus handoff to the remaining tab, preventing stale
   Paneru/sketchybar focus after closing a Ghostty tab;
+- nonblocking custom-runner external drain tests for empty queues, bursts,
+  mouse-move coalescing, exit, and disconnected receivers;
 - `scripts/profile-runtime-latency.sh` for repeatable quiet-idle query latency,
   optional safe focus-command latency, optional subscriber delivery, runtime
   diagnostics, and a quiet-idle `top` sample.
@@ -341,11 +344,12 @@ the custom runner work:
   reconciliation throttling.
 - Deferred perf-04 spike: computed long-idle deadlines inside `pump_events` were
   not shippable; see [`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md).
-- New custom-runner work from perf-08 through perf-20: deterministic policy model,
+- New custom-runner work from perf-08 through perf-22: deterministic policy model,
   top-level runner, dedicated `CFRunLoopSource`/`CFRunLoopTimer` primitives,
   dirty settle-loop, runner-visible deadline registry, adaptive idle,
   runner-owned CFRunLoop wait, deadline-source-of-truth migration, validation
-  tooling, docs, and fallback knobs.
+  tooling, process-lifetime wake-source ownership, nonblocking external drain,
+  docs, and fallback knobs.
 - Manual result on this branch: responsiveness felt good throughout reload and
   normal use; first-interaction sluggishness was fixed by resetting the timeout
   ramp after internal events; Ghostty native-tab close focus no longer reproduced
