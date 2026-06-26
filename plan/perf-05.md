@@ -1,5 +1,12 @@
 # perf-05: Evaluate and optionally switch Bevy schedules to single-threaded execution
 
+## Revised context after `perf-loop-spike`
+
+This is the best short-term optimization path if perf-04's custom runner is too
+large or risky. Manager feedback agrees that we should preserve the robust legacy
+50 ms cadence while reducing per-tick cost, rather than tuning longer sleeps
+inside `pump_events`.
+
 ## Goal
 Determine whether Bevy’s multi-threaded executor is responsible for meaningful idle overhead and switch to single-threaded execution if it improves efficiency without hurting responsiveness.
 
@@ -7,6 +14,8 @@ Determine whether Bevy’s multi-threaded executor is responsible for meaningful
 Sampling shows Bevy worker threads waking and blocking on semaphores. Paneru’s workload is mostly small state transitions plus macOS AX calls, so multi-thread scheduling may cost more than it saves.
 
 ## Scope
+- Preserve the known-responsive polling cadence while testing this ticket; do not
+  combine with long-idle-deadline experiments.
 - Add a configuration or compile-time experiment to run relevant schedules single-threaded.
 - Measure:
   - idle CPU

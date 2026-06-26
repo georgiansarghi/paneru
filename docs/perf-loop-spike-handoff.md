@@ -142,6 +142,43 @@ The legacy 50 ms polling behavior masks coordination gaps. Longer sleeps expose
 that some paths do not wake and drive Bevy deterministically enough for a window
 manager, where shortcut-to-animation latency must feel immediate.
 
+## Manager feedback incorporated
+
+The failed perf-04 attempts failed for a structural reason: they kept the wait
+inside a Bevy `PreUpdate` system. The branch tried to improve this shape:
+
+```text
+Bevy app.update()
+  PreUpdate:
+    pump_events() blocks/waits
+    drain external queue
+  Update/PostUpdate:
+    process messages, mutate layout, animate, commit
+```
+
+Problems with this shape:
+
+1. External wake is not the same as being Bevy-ready. `EventSender::send` can wake
+   the CFRunLoop, but Bevy only processes the event after `pump_events` returns
+   and schedules continue.
+2. Bevy-internal work is not wakeable. Code paths like
+   `commands.trigger(SendMessageTrigger(Event::WindowFocused { ... }))` write to
+   Bevy's internal messages/triggers, not the external `WakeableEventQueue`. If a
+   follow-up update is needed, the next update can immediately re-enter
+   `pump_events` and sleep despite pending internal work.
+3. The computed deadline policy only sees Paneru `Timeout` components. Bevy
+   `on_timer(...)` run conditions have internal deadline state that is not
+   visible to the policy.
+4. `CFRunLoopWakeUp` is weaker than a dedicated run-loop source/timer whose
+   callback deterministically hands control back to Paneru's scheduler.
+5. Long idle sleeps expose every missed wake or pending-internal-message delay as
+   shortcut/animation lag.
+
+Revised conclusion: do not continue tuning idle constants in the existing
+`pump_events` design. A real event-driven implementation should move waiting
+outside Bevy into a custom top-level runner, or short-term work should focus on
+reducing per-tick cost while preserving the legacy 50 ms cadence.
+
 ## Important implementation detail
 
 Paneru uses Bevy `MinimalPlugins`, whose default schedule runner loops as fast as
