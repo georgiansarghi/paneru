@@ -40,8 +40,8 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{PlatformCallbacks, WinID};
 use crate::runtime_driver::{
-    DeadlineReason, RuntimeActivityReason, RuntimeDeadlineClock, RuntimeDeadlines, RuntimeDirty,
-    RuntimeDirtyReason, RuntimeDriverActive,
+    DeadlineReason, RuntimeActivity, RuntimeActivityReason, RuntimeDeadlineClock, RuntimeDeadlines,
+    RuntimeDirty, RuntimeDirtyReason, RuntimeDriverActive,
 };
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
@@ -81,6 +81,10 @@ pub(super) fn update_runtime_deadlines(
     mut deadlines: Option<ResMut<RuntimeDeadlines>>,
     clock: Option<Res<RuntimeDeadlineClock>>,
     low_power_mode: Option<Res<LowPowerMode>>,
+    config: Option<Res<Config>>,
+    runtime_activity: Option<Res<RuntimeActivity>>,
+    strips: Query<&LayoutStrip>,
+    mut diagnostics: Option<ResMut<LoopDiagnostics>>,
     repositioning: Query<(), With<RepositionMarker>>,
     resizing: Query<(), With<ResizeMarker>>,
     scrolling: Query<(), With<Scrolling>>,
@@ -88,7 +92,9 @@ pub(super) fn update_runtime_deadlines(
     timeouts: Query<&Timeout>,
 ) {
     const FRAME_DEADLINE: Duration = Duration::from_millis(16);
-    const NATIVE_TAB_DEADLINE: Duration = Duration::from_millis(250);
+    const NATIVE_TAB_DEADLINE: Duration = Duration::from_millis(super::NATIVE_TAB_RECONCILE_MS);
+    const NATIVE_TAB_SAFETY_CHECK: Duration = Duration::from_secs(30);
+    const NATIVE_TAB_ACTIVITY_GRACE: Duration = Duration::from_secs(2);
     const LOST_FOCUS_WATCHDOG: Duration = Duration::from_secs(1);
     const ORPHAN_WORKSPACE_WATCHDOG: Duration = Duration::from_secs(1);
     const REFRESH_WINDOW_SIZES: Duration = Duration::from_secs(1);
@@ -103,6 +109,8 @@ pub(super) fn update_runtime_deadlines(
         return;
     };
     let now = clock.now();
+    let due_reasons = deadlines.due_reasons(now);
+    let mut rescheduled_reasons = Vec::new();
 
     for transient in [
         DeadlineReason::AnimationFrame,
@@ -118,9 +126,11 @@ pub(super) fn update_runtime_deadlines(
         || !flash_messages.is_empty()
     {
         deadlines.set_after(now, DeadlineReason::AnimationFrame, FRAME_DEADLINE);
+        rescheduled_reasons.push(DeadlineReason::AnimationFrame);
     }
     if low_power_mode.is_some() {
         deadlines.set_after(now, DeadlineReason::LowPowerWatchdog, LOW_POWER_CHECK);
+        rescheduled_reasons.push(DeadlineReason::LowPowerWatchdog);
     }
     if let Some(remaining) = timeouts
         .iter()
@@ -128,30 +138,116 @@ pub(super) fn update_runtime_deadlines(
         .min()
     {
         deadlines.set_after(now, DeadlineReason::TimeoutComponent, remaining);
+        rescheduled_reasons.push(DeadlineReason::TimeoutComponent);
     }
 
-    deadlines.ensure_repeating_after(
-        now,
-        DeadlineReason::NativeTabReconciliation,
-        NATIVE_TAB_DEADLINE,
-    );
-    deadlines.ensure_repeating_after(now, DeadlineReason::LostFocusWatchdog, LOST_FOCUS_WATCHDOG);
-    deadlines.ensure_repeating_after(
-        now,
-        DeadlineReason::OrphanWorkspaceWatchdog,
-        ORPHAN_WORKSPACE_WATCHDOG,
-    );
-    deadlines.ensure_repeating_after(
-        now,
-        DeadlineReason::RefreshWindowSizes,
-        REFRESH_WINDOW_SIZES,
-    );
-    deadlines.ensure_repeating_after(now, DeadlineReason::StateSave, PERIODIC_STATE_SAVE);
-    deadlines.ensure_repeating_after(
-        now,
-        DeadlineReason::PeriodicMaintenance,
-        PERIODIC_MAINTENANCE,
-    );
+    let native_tab_plan = native_tab_deadline_plan(NativeTabDeadlineInputs {
+        enabled: config
+            .as_ref()
+            .is_none_or(|config| config.native_tabs_enabled()),
+        has_tab_groups: layout_has_native_tab_groups(&strips),
+        recent_activity: runtime_activity
+            .as_ref()
+            .is_some_and(|activity| activity.recent(now, NATIVE_TAB_ACTIVITY_GRACE)),
+        reconcile: NATIVE_TAB_DEADLINE,
+        safety: NATIVE_TAB_SAFETY_CHECK,
+    });
+    if apply_native_tab_deadline_plan(deadlines, now, native_tab_plan) {
+        rescheduled_reasons.push(DeadlineReason::NativeTabReconciliation);
+    }
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.record_native_tab_deadline_policy(native_tab_plan.diagnostic);
+    }
+    for (reason, period) in [
+        (DeadlineReason::LostFocusWatchdog, LOST_FOCUS_WATCHDOG),
+        (
+            DeadlineReason::OrphanWorkspaceWatchdog,
+            ORPHAN_WORKSPACE_WATCHDOG,
+        ),
+        (DeadlineReason::RefreshWindowSizes, REFRESH_WINDOW_SIZES),
+        (DeadlineReason::StateSave, PERIODIC_STATE_SAVE),
+        (DeadlineReason::PeriodicMaintenance, PERIODIC_MAINTENANCE),
+    ] {
+        if deadlines.ensure_repeating_after(now, reason, period) {
+            rescheduled_reasons.push(reason);
+        }
+    }
+
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.record_runtime_deadline_update(&due_reasons, &rescheduled_reasons);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeTabDeadlineInputs {
+    enabled: bool,
+    has_tab_groups: bool,
+    recent_activity: bool,
+    reconcile: Duration,
+    safety: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeTabDeadlinePlan {
+    cadence: Option<Duration>,
+    diagnostic: &'static str,
+}
+
+fn native_tab_deadline_plan(inputs: NativeTabDeadlineInputs) -> NativeTabDeadlinePlan {
+    if !inputs.enabled {
+        return NativeTabDeadlinePlan {
+            cadence: None,
+            diagnostic: "disabled",
+        };
+    }
+
+    if inputs.has_tab_groups {
+        return NativeTabDeadlinePlan {
+            cadence: Some(inputs.reconcile),
+            diagnostic: "active_tab_group",
+        };
+    }
+
+    if inputs.recent_activity {
+        return NativeTabDeadlinePlan {
+            cadence: Some(inputs.reconcile),
+            diagnostic: "recent_activity",
+        };
+    }
+
+    NativeTabDeadlinePlan {
+        cadence: Some(inputs.safety),
+        diagnostic: "safety_check",
+    }
+}
+
+fn apply_native_tab_deadline_plan(
+    deadlines: &mut RuntimeDeadlines,
+    now: Duration,
+    plan: NativeTabDeadlinePlan,
+) -> bool {
+    deadlines.clear(DeadlineReason::NativeTabReconciliation);
+    plan.cadence.is_some_and(|cadence| {
+        deadlines.ensure_repeating_after(now, DeadlineReason::NativeTabReconciliation, cadence)
+    })
+}
+
+fn layout_has_native_tab_groups(strips: &Query<&LayoutStrip>) -> bool {
+    strips.iter().any(strip_has_native_tab_group)
+}
+
+fn strip_has_native_tab_group(strip: &LayoutStrip) -> bool {
+    let mut seen = HashSet::new();
+    strip.all_windows().into_iter().any(|entity| {
+        if !seen.insert(entity) {
+            return false;
+        }
+        let Some(group) = strip.tab_group(entity) else {
+            return false;
+        };
+        seen.extend(group.iter().copied());
+        true
+    })
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
@@ -1827,6 +1923,203 @@ mod tests {
         assert_eq!(
             classify_timeout_wake(LoopActivity::default()),
             LoopWakeReason::TimeoutWatchdog
+        );
+    }
+
+    #[test]
+    fn native_tab_deadline_disabled_registers_no_deadline() {
+        let mut deadlines = RuntimeDeadlines::default();
+        let now = Duration::from_secs(10);
+
+        apply_native_tab_deadline_plan(
+            &mut deadlines,
+            now,
+            native_tab_deadline_plan(NativeTabDeadlineInputs {
+                enabled: false,
+                has_tab_groups: true,
+                recent_activity: true,
+                reconcile: Duration::from_millis(250),
+                safety: Duration::from_secs(30),
+            }),
+        );
+
+        assert_eq!(deadlines.earliest_wait(now), None);
+    }
+
+    #[test]
+    fn native_tab_deadline_idle_without_groups_uses_safety_fallback() {
+        let mut deadlines = RuntimeDeadlines::default();
+        let now = Duration::from_secs(10);
+        let plan = native_tab_deadline_plan(NativeTabDeadlineInputs {
+            enabled: true,
+            has_tab_groups: false,
+            recent_activity: false,
+            reconcile: Duration::from_millis(250),
+            safety: Duration::from_secs(30),
+        });
+
+        apply_native_tab_deadline_plan(&mut deadlines, now, plan);
+
+        assert_eq!(plan.diagnostic, "safety_check");
+        assert_eq!(
+            deadlines.earliest_wait(now),
+            Some(crate::runtime_driver::WaitDeadline {
+                duration: Duration::from_secs(30),
+                reason: DeadlineReason::NativeTabReconciliation,
+            })
+        );
+    }
+
+    #[test]
+    fn native_tab_deadline_active_group_uses_reconcile_cadence() {
+        let plan = native_tab_deadline_plan(NativeTabDeadlineInputs {
+            enabled: true,
+            has_tab_groups: true,
+            recent_activity: false,
+            reconcile: Duration::from_millis(250),
+            safety: Duration::from_secs(30),
+        });
+
+        assert_eq!(
+            plan,
+            NativeTabDeadlinePlan {
+                cadence: Some(Duration::from_millis(250)),
+                diagnostic: "active_tab_group",
+            }
+        );
+    }
+
+    #[test]
+    fn native_tab_deadline_recent_activity_uses_bounded_reconcile_cadence() {
+        let plan = native_tab_deadline_plan(NativeTabDeadlineInputs {
+            enabled: true,
+            has_tab_groups: false,
+            recent_activity: true,
+            reconcile: Duration::from_millis(250),
+            safety: Duration::from_secs(30),
+        });
+
+        assert_eq!(
+            plan,
+            NativeTabDeadlinePlan {
+                cadence: Some(Duration::from_millis(250)),
+                diagnostic: "recent_activity",
+            }
+        );
+    }
+
+    #[test]
+    fn native_tab_group_detection_observes_layout_tabs() {
+        let mut world = bevy::ecs::world::World::new();
+        let e1 = world.spawn_empty().id();
+        let e2 = world.spawn_empty().id();
+        let mut strip = LayoutStrip::default();
+
+        assert!(!strip_has_native_tab_group(&strip));
+
+        strip.append_tab_group(&[e1, e2]);
+
+        assert!(strip_has_native_tab_group(&strip));
+    }
+
+    #[test]
+    fn always_scheduled_native_tab_reconciliation_caps_quiet_idle_at_250ms() {
+        let policy = crate::runtime_driver::RuntimeDriverPolicy::new(
+            crate::runtime_driver::RuntimeDriverConfig {
+                frame_interval: Duration::from_millis(16),
+                interactive_idle_cap: Duration::from_millis(50),
+                idle_watchdog_cap: Duration::from_secs(1),
+                low_power_watchdog_cap: Duration::from_millis(500),
+                interactive_grace_period: Duration::from_secs(1),
+            },
+        );
+        let now = Duration::from_secs(10);
+
+        assert_eq!(
+            policy.decide(crate::runtime_driver::RuntimeDriverState {
+                now,
+                next_visible_deadline: Some(crate::runtime_driver::RuntimeDeadline::new(
+                    now + Duration::from_millis(250),
+                    DeadlineReason::NativeTabReconciliation,
+                )),
+                ..crate::runtime_driver::RuntimeDriverState::default()
+            }),
+            crate::runtime_driver::RunnerDecision::Wait(crate::runtime_driver::WaitDeadline {
+                duration: Duration::from_millis(250),
+                reason: DeadlineReason::NativeTabReconciliation,
+            })
+        );
+    }
+
+    #[test]
+    fn named_watchdog_deadline_runs_only_when_due_and_reschedules() {
+        let mut deadlines = RuntimeDeadlines::default();
+        let now = Duration::from_secs(10);
+
+        assert!(deadlines.ensure_repeating_after(
+            now,
+            DeadlineReason::LostFocusWatchdog,
+            Duration::from_secs(1),
+        ));
+        assert!(!deadlines.due(now, DeadlineReason::LostFocusWatchdog));
+        assert!(deadlines.due(
+            now + Duration::from_secs(1),
+            DeadlineReason::LostFocusWatchdog
+        ));
+        assert!(deadlines.ensure_repeating_after(
+            now + Duration::from_secs(1),
+            DeadlineReason::LostFocusWatchdog,
+            Duration::from_secs(1),
+        ));
+        assert!(!deadlines.due(
+            now + Duration::from_secs(1),
+            DeadlineReason::LostFocusWatchdog
+        ));
+    }
+
+    #[test]
+    fn critical_deadline_periods_are_registered_and_rescheduled() {
+        let now = Duration::from_secs(10);
+        for (reason, period) in [
+            (DeadlineReason::LostFocusWatchdog, Duration::from_secs(1)),
+            (
+                DeadlineReason::OrphanWorkspaceWatchdog,
+                Duration::from_secs(1),
+            ),
+            (DeadlineReason::RefreshWindowSizes, Duration::from_secs(1)),
+            (DeadlineReason::StateSave, Duration::from_secs(300)),
+            (
+                DeadlineReason::PeriodicMaintenance,
+                Duration::from_secs(300),
+            ),
+        ] {
+            let mut deadlines = RuntimeDeadlines::default();
+            assert!(deadlines.ensure_repeating_after(now, reason, period));
+            assert!(!deadlines.due(now, reason));
+            assert!(deadlines.due(now + period, reason));
+            assert!(deadlines.ensure_repeating_after(now + period, reason, period));
+            assert!(!deadlines.due(now + period, reason));
+        }
+    }
+
+    #[test]
+    fn diagnostics_records_due_and_rescheduled_deadlines() {
+        let mut diagnostics = LoopDiagnostics::default();
+        diagnostics.record_runtime_deadline_update(
+            &[
+                DeadlineReason::LostFocusWatchdog,
+                DeadlineReason::NativeTabReconciliation,
+            ],
+            &[DeadlineReason::StateSave],
+        );
+
+        assert_eq!(
+            diagnostics.last_due_deadline_reasons,
+            vec!["lost_focus_watchdog", "native_tab_reconciliation"]
+        );
+        assert_eq!(
+            diagnostics.last_rescheduled_deadline_reasons,
+            vec!["state_save"]
         );
     }
 
