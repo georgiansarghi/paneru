@@ -15,8 +15,36 @@ Before the event-driven loop changes, Paneru's runtime loop is polling-oriented:
 
 That means an otherwise idle daemon is expected to wake regularly, roughly on a
 50 ms cadence (about 20 idle wake opportunities per second) before additional
-macOS/AX/config events are considered. Later perf tickets should reduce idle CPU
-and wakeups while preserving command latency and watchdog repairs.
+macOS/AX/config events are considered.
+
+## Current architecture after perf-01 through perf-06
+
+The current shippable branch intentionally keeps the responsive legacy wait
+model, but reduces per-tick cost:
+
+- **Legacy Cocoa/AppKit pump retained by default.** `pump_events` still runs at
+  the start of Bevy `PreUpdate` and pumps AppKit with the established timeout
+  ramp. This preserves shortcut and animation responsiveness.
+- **Idle watchdog polling is intentional.** The ~50 ms idle cap is not an
+  accidental busy loop; it is the current safety mechanism that prevents missed
+  macOS/AppKit/AX wakeups or Bevy-internal follow-up work from becoming visible
+  latency. Low-power mode keeps the previous 500 ms cap.
+- **Frame-active work stays fast.** Active repositioning, resizing, scrolling,
+  and flash messages keep the 16 ms frame cap.
+- **External events are wakeable.** `EventSender::send` queues the event and then
+  wakes the main run loop with `CFRunLoopWakeUp`; this is a prerequisite for a
+  future custom runner, but not relied on as the only responsiveness mechanism.
+- **Bevy schedules are single-threaded by default.** Paneru's schedules use
+  `ExecutorKind::SingleThreaded` to avoid multi-thread scheduler/worker overhead
+  for a mostly main-thread/macOS-bound workload.
+- **Native-tab reconciliation is throttled.** The expensive AX/window-list pass
+  runs every 250 ms instead of every app tick.
+- **perf-04 custom runner is deferred.** Longer idle deadlines inside the
+  current `pump_events` design caused visible variable latency. A future attempt
+  should move waiting outside Bevy into a custom top-level runner.
+
+The tradeoff is explicit: Paneru keeps a moderate idle wake frequency to protect
+command/shortcut latency, while reducing the amount of work done on each wake.
 
 ## One-command local profile
 
@@ -79,7 +107,9 @@ The ordering is intentional: event first, wake second. If the receiver is gone,
 background-thread wake signalling, disconnected receiver behavior, and burst
 send delivery.
 
-## Single-threaded schedule experiment
+## Rollout controls and experiments
+
+### Single-threaded schedules
 
 perf-05 keeps the known-responsive legacy Cocoa pump / ~50 ms idle cadence and
 switches Paneru's Bevy schedules to the single-threaded executor by default. The
@@ -101,7 +131,7 @@ native tabs still worked, and `scripts/profile-idle.sh --out
 perf-runs/perf-05-throttled-single-thread` reported 1.8% Paneru CPU at the end
 of the 30s `top` window with `paneru query active` median latency of 11.066 ms.
 
-## Computed idle deadline experiment
+### Computed idle deadline / CFRunLoop pump experiment
 
 perf-04 is in spike mode and is not considered shippable. See
 [`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md) for the detailed
@@ -121,6 +151,40 @@ PANERU_CF_RUN_LOOP_PUMP=1 paneru
 
 Default runtime behavior preserves the legacy AppKit pump and idle timeout ramp
 while perf-05 tests per-tick cost reductions.
+
+### Fallback knob summary
+
+| Knob | Default | Effect | Removal criteria |
+| --- | --- | --- | --- |
+| `PANERU_MULTI_THREADED_SCHEDULES=1` | unset | Restores Bevy's multi-threaded schedule executor for comparison or emergency fallback. | Remove after single-threaded scheduling has shipped across enough macOS/Paneru usage without regressions. |
+| `PANERU_CF_RUN_LOOP_PUMP=1` | unset | Enables the non-shippable CFRunLoop pump/deadline spike. | Remove or replace when a real custom runner owns waiting outside Bevy. |
+
+## Robustness tests added
+
+perf-06 added deterministic tests for the risks found during the loop spike:
+
+- state queries respond on the next Bevy update;
+- runtime diagnostics queries respond on the next Bevy update;
+- Bevy-internal command follow-up work is not dependent on the external wake
+  queue;
+- animation/reposition work is created promptly at schedule level;
+- native-tab reconciliation remains throttled to 250 ms;
+- fallback knobs have documented defaults.
+
+Existing perf-03 tests cover external event burst delivery and disconnected
+receiver behavior.
+
+## PR / handoff summary
+
+- Baseline tooling: `scripts/profile-idle.sh` and this document.
+- Accepted runtime changes: diagnostics, wakeable external queue,
+  single-threaded schedules by default, native-tab reconciliation throttling.
+- Deferred runtime change: computed long-idle deadlines/custom runner.
+- Manual result on this branch: responsiveness felt good, native tabs worked,
+  and the local profile reported 1.8% Paneru CPU at the end of the 30s `top`
+  window with `paneru query active` median latency of 11.066 ms.
+- For the failed perf-04 attempt log and future custom-runner suggestions, see
+  [`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md).
 
 ## Interpreting results
 
