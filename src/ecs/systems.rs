@@ -226,10 +226,21 @@ fn apply_native_tab_deadline_plan(
     now: Duration,
     plan: NativeTabDeadlinePlan,
 ) -> bool {
-    deadlines.clear(DeadlineReason::NativeTabReconciliation);
-    plan.cadence.is_some_and(|cadence| {
-        deadlines.ensure_repeating_after(now, DeadlineReason::NativeTabReconciliation, cadence)
-    })
+    let Some(cadence) = plan.cadence else {
+        deadlines.clear(DeadlineReason::NativeTabReconciliation);
+        return false;
+    };
+
+    let target = now + cadence;
+    if deadlines
+        .deadline_at(DeadlineReason::NativeTabReconciliation)
+        .is_none_or(|existing| existing <= now || existing > target)
+    {
+        deadlines.set_after(now, DeadlineReason::NativeTabReconciliation, cadence);
+        return true;
+    }
+
+    false
 }
 
 fn layout_has_native_tab_groups(strips: &Query<&LayoutStrip>) -> bool {
@@ -2049,6 +2060,68 @@ mod tests {
                 cadence: Some(Duration::from_millis(250)),
                 diagnostic: "recent_activity",
             }
+        );
+    }
+
+    #[test]
+    fn native_tab_deadline_is_not_postponed_by_repeated_activity() {
+        let mut deadlines = RuntimeDeadlines::default();
+        let now = Duration::from_secs(10);
+        let plan = native_tab_deadline_plan(NativeTabDeadlineInputs {
+            enabled: true,
+            has_tab_groups: false,
+            recent_activity: true,
+            reconcile: Duration::from_millis(250),
+            safety: Duration::from_secs(30),
+        });
+
+        assert!(apply_native_tab_deadline_plan(&mut deadlines, now, plan));
+        assert_eq!(
+            deadlines.deadline_at(DeadlineReason::NativeTabReconciliation),
+            Some(now + Duration::from_millis(250))
+        );
+
+        assert!(!apply_native_tab_deadline_plan(
+            &mut deadlines,
+            now + Duration::from_millis(50),
+            plan,
+        ));
+        assert_eq!(
+            deadlines.deadline_at(DeadlineReason::NativeTabReconciliation),
+            Some(now + Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn native_tab_deadline_shortens_safety_deadline_on_activity() {
+        let mut deadlines = RuntimeDeadlines::default();
+        let now = Duration::from_secs(10);
+        assert!(apply_native_tab_deadline_plan(
+            &mut deadlines,
+            now,
+            native_tab_deadline_plan(NativeTabDeadlineInputs {
+                enabled: true,
+                has_tab_groups: false,
+                recent_activity: false,
+                reconcile: Duration::from_millis(250),
+                safety: Duration::from_secs(30),
+            }),
+        ));
+
+        assert!(apply_native_tab_deadline_plan(
+            &mut deadlines,
+            now + Duration::from_secs(1),
+            native_tab_deadline_plan(NativeTabDeadlineInputs {
+                enabled: true,
+                has_tab_groups: false,
+                recent_activity: true,
+                reconcile: Duration::from_millis(250),
+                safety: Duration::from_secs(30),
+            }),
+        ));
+        assert_eq!(
+            deadlines.deadline_at(DeadlineReason::NativeTabReconciliation),
+            Some(now + Duration::from_secs(1) + Duration::from_millis(250))
         );
     }
 
