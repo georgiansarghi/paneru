@@ -32,6 +32,7 @@ use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
 use crate::platform::WinID;
+use crate::runtime_driver::{RuntimeDirty, RuntimeDirtyReason};
 use crate::util::symlink_target;
 
 /// Computes the passthrough keybinding set for the given window/app and
@@ -853,8 +854,17 @@ fn give_away_focus(
     commands: &mut Commands,
 ) {
     if active_strip.tabbed(entity) {
-        // Do not give away focus for tabbed windows.
-        // Remaining tab gets the focus.
+        // Native tabs share one visual slot. When the selected tab closes,
+        // macOS can briefly report focus on an unrelated neighbouring app
+        // before the remaining tab's AX focus notification arrives. Make the
+        // intended handoff explicit so Paneru state, subscribers, and the OS all
+        // agree on the remaining tab.
+        if let Some(neighbour) = remaining_tab_focus_candidate(entity, active_strip)
+            && windows.get(neighbour).is_some()
+        {
+            config.set_ffm_flag(None);
+            commands.focus_entity(neighbour, true);
+        }
         return;
     }
 
@@ -890,6 +900,13 @@ fn give_away_focus(
         // AX API to raise the neighbour and inserts FocusedMarker directly.
         commands.focus_entity(neighbour, true);
     }
+}
+
+fn remaining_tab_focus_candidate(entity: Entity, active_strip: &LayoutStrip) -> Option<Entity> {
+    active_strip
+        .tab_group(entity)?
+        .into_iter()
+        .find(|candidate| *candidate != entity)
 }
 
 fn same_parent(entity: Entity, parent: Entity, windows: &Windows) -> bool {
@@ -1278,9 +1295,13 @@ pub(super) fn window_removal_trigger(
 pub(super) fn send_message_trigger(
     trigger: On<SendMessageTrigger>,
     mut messages: MessageWriter<Event>,
+    mut dirty: Option<ResMut<RuntimeDirty>>,
 ) {
     let event = &trigger.event().0;
     messages.write(event.clone());
+    if let Some(dirty) = dirty.as_mut() {
+        dirty.mark(RuntimeDirtyReason::InternalMessageEmitted);
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1387,5 +1408,40 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::world::World;
+
+    use super::*;
+
+    #[test]
+    fn remaining_tab_focus_candidate_prefers_sibling_tab() {
+        let mut world = World::new();
+        let closing = world.spawn_empty().id();
+        let remaining = world.spawn_empty().id();
+        let other = world.spawn_empty().id();
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.insert_tab_group_at(0, &[closing, remaining]);
+        strip.append(other);
+
+        assert_eq!(
+            remaining_tab_focus_candidate(closing, &strip),
+            Some(remaining)
+        );
+    }
+
+    #[test]
+    fn remaining_tab_focus_candidate_ignores_non_tabbed_window() {
+        let mut world = World::new();
+        let closing = world.spawn_empty().id();
+        let other = world.spawn_empty().id();
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.append(closing);
+        strip.append(other);
+
+        assert_eq!(remaining_tab_focus_candidate(closing, &strip), None);
     }
 }

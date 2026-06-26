@@ -14,6 +14,7 @@ mod menubar;
 mod overlay;
 mod platform;
 mod reader;
+pub mod runtime_driver;
 mod util;
 
 #[cfg(test)]

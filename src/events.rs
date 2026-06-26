@@ -1,9 +1,13 @@
 use bevy::ecs::message::Message;
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFRetained, CFRunLoop, CGPoint};
+use objc2_core_foundation::{
+    CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, CGPoint, kCFRunLoopCommonModes,
+};
 use objc2_core_graphics::CGDirectDisplayID;
+use std::ffi::c_void;
 use std::fmt;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -167,31 +171,92 @@ trait EventWaker: Send + Sync {
     fn wake(&self);
 }
 
-struct MainRunLoopWaker {
-    run_loop: usize,
+#[derive(Clone, Default)]
+struct WakeCoalescer {
+    pending: Arc<AtomicBool>,
 }
 
-// `CFRunLoopWakeUp` is explicitly safe to call from a different thread than the
-// target run loop. We only store the main run loop pointer, which is owned by
-// the process for its lifetime.
+impl WakeCoalescer {
+    fn request_signal(&self) -> bool {
+        !self.pending.swap(true, Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn complete(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+}
+
+struct MainRunLoopWaker {
+    run_loop: CFRetained<CFRunLoop>,
+    source: CFRetained<CFRunLoopSource>,
+    coalescer: WakeCoalescer,
+}
+
+// The source is registered on the main run loop during construction. Apple
+// documents `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` as callable from other
+// threads; `wake` is the only cross-thread operation performed through this
+// wrapper. Registration and invalidation happen while the owner lives on the
+// main thread in normal Paneru startup/shutdown.
 unsafe impl Send for MainRunLoopWaker {}
 unsafe impl Sync for MainRunLoopWaker {}
 
 impl MainRunLoopWaker {
     fn new() -> Option<Self> {
-        CFRunLoop::main().map(|run_loop| Self {
-            run_loop: CFRetained::as_ptr(&run_loop).as_ptr() as usize,
+        let run_loop = CFRunLoop::main()?;
+        let coalescer = WakeCoalescer::default();
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: Arc::as_ptr(&coalescer.pending).cast_mut().cast::<c_void>(),
+            retain: Some(retain_atomic_bool),
+            release: Some(release_atomic_bool),
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(perform_wake_source),
+        };
+        let source = unsafe { CFRunLoopSource::new(None, 0, &raw mut context)? };
+        CFRunLoop::add_source(&run_loop, Some(&source), unsafe { kCFRunLoopCommonModes });
+        Some(Self {
+            run_loop,
+            source,
+            coalescer,
         })
+    }
+}
+
+impl Drop for MainRunLoopWaker {
+    fn drop(&mut self) {
+        self.source.invalidate();
+        CFRunLoop::remove_source(&self.run_loop, Some(&self.source), unsafe {
+            kCFRunLoopCommonModes
+        });
     }
 }
 
 impl EventWaker for MainRunLoopWaker {
     fn wake(&self) {
-        let run_loop = self.run_loop as *const CFRunLoop;
-        if let Some(run_loop) = unsafe { run_loop.as_ref() } {
-            run_loop.wake_up();
+        if self.coalescer.request_signal() {
+            self.source.signal();
         }
+        self.run_loop.wake_up();
     }
+}
+
+unsafe extern "C-unwind" fn retain_atomic_bool(info: *const c_void) -> *const c_void {
+    unsafe { Arc::increment_strong_count(info.cast::<AtomicBool>()) };
+    info
+}
+
+unsafe extern "C-unwind" fn release_atomic_bool(info: *const c_void) {
+    unsafe { Arc::decrement_strong_count(info.cast::<AtomicBool>()) };
+}
+
+unsafe extern "C-unwind" fn perform_wake_source(info: *mut c_void) {
+    let pending = unsafe { &*info.cast::<AtomicBool>() };
+    pending.store(false, Ordering::SeqCst);
 }
 
 #[derive(Default)]
@@ -350,5 +415,15 @@ mod tests {
             ));
         }
         assert_eq!(waker.count.load(Ordering::SeqCst), 128);
+    }
+
+    #[test]
+    fn wake_coalescer_signals_once_until_source_performs() {
+        let coalescer = WakeCoalescer::default();
+
+        assert!(coalescer.request_signal());
+        assert!(!coalescer.request_signal());
+        coalescer.complete();
+        assert!(coalescer.request_signal());
     }
 }
