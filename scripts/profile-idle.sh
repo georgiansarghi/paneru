@@ -167,7 +167,11 @@ if command -v powermetrics >/dev/null 2>&1; then
   elif command -v timeout >/dev/null 2>&1; then
     timeout_cmd=(timeout "$((seconds + 15))")
   fi
-  "${timeout_cmd[@]}" powermetrics --samplers tasks --show-process-energy -n 1 -i "$((seconds * 1000))" >"$out_dir/powermetrics.txt" 2>&1 || true
+  if [[ ${#timeout_cmd[@]} -gt 0 ]]; then
+    "${timeout_cmd[@]}" powermetrics --samplers tasks --show-process-energy -n 1 -i "$((seconds * 1000))" >"$out_dir/powermetrics.txt" 2>&1 || true
+  else
+    powermetrics --samplers tasks --show-process-energy -n 1 -i "$((seconds * 1000))" >"$out_dir/powermetrics.txt" 2>&1 || true
+  fi
 else
   echo "powermetrics not found" >"$out_dir/powermetrics.txt"
 fi
