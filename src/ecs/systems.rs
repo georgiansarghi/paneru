@@ -5,8 +5,7 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
-    Commands, Local, NonSend, NonSendMut, ParallelCommands, ParamSet, Populated, Query, Res,
-    ResMut, Single,
+    Commands, Local, NonSend, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single,
 };
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
@@ -1562,6 +1561,7 @@ pub(crate) fn reconcile_tabbed_windows(
     )>,
     mut apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut stale_tab_candidates: Local<HashMap<Entity, u8>>,
     mut visible_tab_groups: Local<HashMap<Vec<Entity>, u8>>,
     mut commands: Commands,
@@ -1671,7 +1671,7 @@ pub(crate) fn reconcile_tabbed_windows(
                 .or_insert_with(|| {
                     apps.get(candidate.app_entity)
                         .map(|app| {
-                            app.window_list()
+                            app.window_list(&config)
                                 .into_iter()
                                 .map(|window| window.id())
                                 .collect::<HashSet<_>>()
@@ -1720,7 +1720,7 @@ pub(crate) fn reconcile_tabbed_windows(
                         .and_then(|app| app.focused_window_id().ok())
                 });
                 if let Ok(app) = apps.get(app_entity) {
-                    missing_windows.extend(app.window_list().into_iter().filter(|window| {
+                    missing_windows.extend(app.window_list(&config).into_iter().filter(|window| {
                         !represented_ids.contains(&window.id())
                             && (on_screen_ids.contains(&window.id())
                                 || focused_id == Some(window.id()))
