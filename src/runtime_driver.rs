@@ -150,6 +150,10 @@ impl RuntimeDeadlines {
             .is_some_and(|deadline| *deadline <= now)
     }
 
+    pub(crate) fn deadline_at(&self, reason: DeadlineReason) -> Option<Duration> {
+        self.deadlines.get(&reason).copied()
+    }
+
     pub(crate) fn due_reasons(&self, now: Duration) -> Vec<DeadlineReason> {
         self.deadlines
             .iter()
