@@ -51,6 +51,8 @@ mod systems;
 mod triggers;
 pub mod workspace;
 
+pub(crate) use systems::{classify_timeout_wake, loop_timeout_limit_ms};
+
 pub(crate) const NATIVE_TAB_RECONCILE_MS: u64 = 250;
 
 pub(crate) const fn single_threaded_schedules_enabled_for_env(
@@ -177,6 +179,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not_swiping)
                 .run_if(on_timer(native_tab_reconcile_period())),
             crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
+        ),
+    );
+    app.add_systems(
+        Last,
+        (
+            systems::update_runtime_deadlines,
+            systems::record_runtime_dirty,
         ),
     );
 }
@@ -502,6 +511,13 @@ pub(crate) struct LoopDiagnostics {
     pub last_activity: LoopActivity,
     pub last_timeout_ms: u32,
     pub last_timeout_limit_ms: u32,
+    pub dirty_settle_updates: u64,
+    pub dirty_settle_guard_hits: u64,
+    pub last_dirty_reasons: Vec<&'static str>,
+    pub last_runner_deadline_reason: Option<&'static str>,
+    pub last_runner_deadline_ms: Option<u32>,
+    pub recent_runtime_activity: bool,
+    pub runtime_activity_reasons: Vec<&'static str>,
 }
 
 impl LoopDiagnostics {
@@ -525,6 +541,29 @@ impl LoopDiagnostics {
         self.last_activity = activity;
         self.last_timeout_ms = timeout_ms;
         self.last_timeout_limit_ms = timeout_limit_ms;
+    }
+
+    pub(crate) fn record_dirty_settle(&mut self, reasons: &[&'static str]) {
+        self.dirty_settle_updates += 1;
+        self.last_dirty_reasons = reasons.to_vec();
+    }
+
+    pub(crate) fn record_dirty_settle_guard(&mut self) {
+        self.dirty_settle_guard_hits += 1;
+    }
+
+    pub(crate) fn record_runner_deadline(
+        &mut self,
+        deadline: Option<crate::runtime_driver::WaitDeadline>,
+    ) {
+        self.last_runner_deadline_reason = deadline.map(|deadline| deadline.reason.as_str());
+        self.last_runner_deadline_ms =
+            deadline.map(|deadline| deadline.duration.as_millis().try_into().unwrap_or(u32::MAX));
+    }
+
+    pub(crate) fn record_runtime_activity(&mut self, activity: (bool, Vec<&'static str>)) {
+        self.recent_runtime_activity = activity.0;
+        self.runtime_activity_reasons = activity.1;
     }
 }
 
@@ -689,6 +728,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: WakeableEventQueue) -> Resu
         .add_plugins((register_triggers, register_systems, register_commands));
 
     configure_schedule_executors(&mut app);
+    crate::runtime_driver::install_custom_runtime_driver(&mut app);
 
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;

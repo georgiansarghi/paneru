@@ -39,6 +39,10 @@ use crate::manager::{
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{PlatformCallbacks, WinID};
+use crate::runtime_driver::{
+    DeadlineReason, RuntimeActivityReason, RuntimeDeadlineClock, RuntimeDeadlines, RuntimeDirty,
+    RuntimeDirtyReason, RuntimeDriverActive,
+};
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
@@ -69,6 +73,190 @@ pub(crate) const fn classify_timeout_wake(activity: LoopActivity) -> LoopWakeRea
 pub(super) fn record_periodic_maintenance(mut diagnostics: Option<ResMut<LoopDiagnostics>>) {
     if let Some(diagnostics) = diagnostics.as_mut() {
         diagnostics.record(LoopWakeReason::PeriodicMaintenance);
+    }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(super) fn update_runtime_deadlines(
+    mut deadlines: Option<ResMut<RuntimeDeadlines>>,
+    clock: Option<Res<RuntimeDeadlineClock>>,
+    low_power_mode: Option<Res<LowPowerMode>>,
+    repositioning: Query<(), With<RepositionMarker>>,
+    resizing: Query<(), With<ResizeMarker>>,
+    scrolling: Query<(), With<Scrolling>>,
+    flash_messages: Query<(), With<FlashMessage>>,
+    timeouts: Query<&Timeout>,
+) {
+    const FRAME_DEADLINE: Duration = Duration::from_millis(16);
+    const NATIVE_TAB_DEADLINE: Duration = Duration::from_millis(250);
+    const LOST_FOCUS_WATCHDOG: Duration = Duration::from_secs(1);
+    const ORPHAN_WORKSPACE_WATCHDOG: Duration = Duration::from_secs(1);
+    const REFRESH_WINDOW_SIZES: Duration = Duration::from_secs(1);
+    const LOW_POWER_CHECK: Duration = Duration::from_secs(60);
+    const PERIODIC_STATE_SAVE: Duration = Duration::from_secs(300);
+    const PERIODIC_MAINTENANCE: Duration = Duration::from_secs(300);
+
+    let Some(deadlines) = deadlines.as_mut() else {
+        return;
+    };
+    let Some(clock) = clock.as_ref() else {
+        return;
+    };
+    let now = clock.now();
+
+    for transient in [
+        DeadlineReason::AnimationFrame,
+        DeadlineReason::LowPowerWatchdog,
+        DeadlineReason::TimeoutComponent,
+    ] {
+        deadlines.clear(transient);
+    }
+
+    if !repositioning.is_empty()
+        || !resizing.is_empty()
+        || !scrolling.is_empty()
+        || !flash_messages.is_empty()
+    {
+        deadlines.set_after(now, DeadlineReason::AnimationFrame, FRAME_DEADLINE);
+    }
+    if low_power_mode.is_some() {
+        deadlines.set_after(now, DeadlineReason::LowPowerWatchdog, LOW_POWER_CHECK);
+    }
+    if let Some(remaining) = timeouts
+        .iter()
+        .map(|timeout| timeout.timer.remaining())
+        .min()
+    {
+        deadlines.set_after(now, DeadlineReason::TimeoutComponent, remaining);
+    }
+
+    deadlines.ensure_repeating_after(
+        now,
+        DeadlineReason::NativeTabReconciliation,
+        NATIVE_TAB_DEADLINE,
+    );
+    deadlines.ensure_repeating_after(now, DeadlineReason::LostFocusWatchdog, LOST_FOCUS_WATCHDOG);
+    deadlines.ensure_repeating_after(
+        now,
+        DeadlineReason::OrphanWorkspaceWatchdog,
+        ORPHAN_WORKSPACE_WATCHDOG,
+    );
+    deadlines.ensure_repeating_after(
+        now,
+        DeadlineReason::RefreshWindowSizes,
+        REFRESH_WINDOW_SIZES,
+    );
+    deadlines.ensure_repeating_after(now, DeadlineReason::StateSave, PERIODIC_STATE_SAVE);
+    deadlines.ensure_repeating_after(
+        now,
+        DeadlineReason::PeriodicMaintenance,
+        PERIODIC_MAINTENANCE,
+    );
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(super) fn record_runtime_dirty(
+    mut dirty: Option<ResMut<RuntimeDirty>>,
+    mut runtime_activity: Option<ResMut<crate::runtime_driver::RuntimeActivity>>,
+    clock: Option<Res<RuntimeDeadlineClock>>,
+    mut messages: MessageReader<Event>,
+    focused_changes: Query<(), Added<FocusedMarker>>,
+    layout_changes: Query<(), Changed<LayoutStrip>>,
+    reposition_inserted: Query<(), Added<RepositionMarker>>,
+    resize_inserted: Query<(), Added<ResizeMarker>>,
+    scrolling_inserted: Query<(), Added<Scrolling>>,
+    flash_inserted: Query<(), Added<FlashMessage>>,
+) {
+    let now = clock.as_ref().map(|clock| clock.now());
+
+    for event in messages.read() {
+        match event {
+            Event::Command { .. } => {
+                if let Some(dirty) = dirty.as_mut() {
+                    dirty.mark(RuntimeDirtyReason::CommandHandled);
+                }
+                mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Command);
+            }
+            Event::MouseDown { .. }
+            | Event::MouseUp { .. }
+            | Event::MouseDragged { .. }
+            | Event::MouseMoved { .. }
+            | Event::Swipe { .. }
+            | Event::VerticalSwipe { .. }
+            | Event::VerticalScrollTick { .. }
+            | Event::Scroll { .. }
+            | Event::TouchpadDown
+            | Event::TouchpadUp => {
+                mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Input);
+            }
+            Event::WindowFocused { .. } => {
+                mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Focus);
+            }
+            Event::WindowCreated { .. }
+            | Event::WindowDestroyed { .. }
+            | Event::WindowMoved { .. }
+            | Event::WindowResized { .. }
+            | Event::WindowMinimized { .. }
+            | Event::WindowDeminimized { .. }
+            | Event::WindowTitleChanged { .. }
+            | Event::ApplicationLaunched { .. }
+            | Event::ApplicationTerminated { .. }
+            | Event::ApplicationFrontSwitched { .. }
+            | Event::ApplicationActivated
+            | Event::ApplicationDeactivated
+            | Event::ApplicationVisible { .. }
+            | Event::ApplicationHidden { .. }
+            | Event::SpaceChanged
+            | Event::DisplayChanged
+            | Event::DisplayAdded { .. }
+            | Event::DisplayRemoved { .. }
+            | Event::DisplayMoved { .. }
+            | Event::DisplayResized { .. }
+            | Event::DisplayConfigured { .. } => {
+                mark_activity(
+                    &mut runtime_activity,
+                    now,
+                    RuntimeActivityReason::WindowEvent,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !focused_changes.is_empty() {
+        if let Some(dirty) = dirty.as_mut() {
+            dirty.mark(RuntimeDirtyReason::FocusMarkerChanged);
+        }
+        mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Focus);
+    }
+    if !layout_changes.is_empty() {
+        // Layout changes are important interactive activity, but they do not by
+        // themselves require another immediate Bevy update: subscriber
+        // broadcasts run in the same frame, and actual animation follow-up is
+        // covered by inserted animation markers below. Marking every changed
+        // strip dirty can keep the settle loop alive during harmless layout
+        // churn.
+        mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Layout);
+    }
+    if !reposition_inserted.is_empty()
+        || !resize_inserted.is_empty()
+        || !scrolling_inserted.is_empty()
+        || !flash_inserted.is_empty()
+    {
+        if let Some(dirty) = dirty.as_mut() {
+            dirty.mark(RuntimeDirtyReason::AnimationMarkerInserted);
+        }
+        mark_activity(&mut runtime_activity, now, RuntimeActivityReason::Animation);
+    }
+}
+
+fn mark_activity(
+    runtime_activity: &mut Option<ResMut<crate::runtime_driver::RuntimeActivity>>,
+    now: Option<Duration>,
+    reason: RuntimeActivityReason,
+) {
+    if let Some((activity, now)) = runtime_activity.as_mut().zip(now) {
+        activity.mark(now, reason);
     }
 }
 
@@ -600,9 +788,14 @@ pub(super) fn pump_events(
     resizing: Query<(), With<ResizeMarker>>,
     scrolling: Query<(), With<Scrolling>>,
     flash_messages: Query<(), With<FlashMessage>>,
+    custom_runtime_driver: Option<Res<RuntimeDriverActive>>,
     mut timeout: Local<u32>,
     mut diagnostics: Option<ResMut<LoopDiagnostics>>,
 ) {
+    if custom_runtime_driver.is_some() {
+        return;
+    }
+
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
         return;

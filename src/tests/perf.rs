@@ -12,6 +12,9 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::Window;
 use crate::platform::cf_run_loop_pump_enabled_for_env;
+use crate::runtime_driver::{
+    custom_runtime_driver_enabled_for_env, legacy_idle_cadence_forced_for_env,
+};
 use crate::tests::TestHarness;
 
 #[test]
@@ -111,4 +114,10 @@ fn perf_fallback_knobs_have_documented_defaults() {
 
     assert!(!cf_run_loop_pump_enabled_for_env(false));
     assert!(cf_run_loop_pump_enabled_for_env(true));
+
+    assert!(custom_runtime_driver_enabled_for_env(false));
+    assert!(!custom_runtime_driver_enabled_for_env(true));
+
+    assert!(!legacy_idle_cadence_forced_for_env(false));
+    assert!(legacy_idle_cadence_forced_for_env(true));
 }
