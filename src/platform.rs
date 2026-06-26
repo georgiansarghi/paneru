@@ -241,13 +241,8 @@ impl PlatformCallbacks {
         }
     }
 
-    fn pump_cocoa_event_loop_cf_run_loop(&mut self, timeout: f64) {
+    pub fn drain_cocoa_event_loop_nonblocking(&mut self) {
         autoreleasepool(|_| {
-            // Experimental perf-04 path. Keep this opt-in: manual testing showed
-            // lower-wakeup long-idle attempts still had shortcut latency unless
-            // the legacy AppKit pump/cadence was preserved.
-            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, timeout, true);
-
             let now = NSDate::dateWithTimeIntervalSinceNow(0.0);
             while let Some(event) = unsafe {
                 self.cocoa_app
@@ -263,6 +258,16 @@ impl PlatformCallbacks {
 
             self.cocoa_app.updateWindows();
         });
+    }
+
+    fn pump_cocoa_event_loop_cf_run_loop(&mut self, timeout: f64) {
+        autoreleasepool(|_| {
+            // Experimental perf-04 path. Keep this opt-in: manual testing showed
+            // lower-wakeup long-idle attempts still had shortcut latency unless
+            // the legacy AppKit pump/cadence was preserved.
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, timeout, true);
+        });
+        self.drain_cocoa_event_loop_nonblocking();
     }
 
     fn pump_cocoa_event_loop_legacy(&mut self, timeout: f64) {
