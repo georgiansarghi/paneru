@@ -2,9 +2,16 @@
 
 Branch: `perf-loop-spike`
 
-This branch is a record of the idle-CPU/wakeup reduction work attempted so far.
-It is **not considered shippable** because every attempt to substantially extend
-idle sleep introduced user-visible shortcut/animation latency.
+This document is a historical handoff for the earlier perf-04 long-idle spike.
+That specific attempt is **not considered shippable** because every attempt to
+substantially extend idle sleep inside the old in-system wait path introduced
+user-visible shortcut/animation latency.
+
+Newer perf-08 through perf-22 work supersedes this conclusion by moving the wait
+boundary into a custom top-level runner, adding a dedicated wake source/timer,
+nonblocking external-event drain, Bevy-internal dirty settling, and
+runner-visible deadlines. See `docs/perf.md` for the current accepted runtime
+architecture and rollout checklist.
 
 ## Original problem
 

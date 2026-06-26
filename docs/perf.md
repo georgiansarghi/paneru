@@ -174,7 +174,9 @@ made runner-visible `RuntimeDeadlines` the source of truth for critical watchdog
 and maintenance instead of hidden Bevy `on_timer(...)` state: lost-focus recovery,
 orphan workspace repair, refresh-window-sizes, low-power checks, periodic state
 save, periodic maintenance, and native-tab reconciliation all run when their named
-deadline is due and are then explicitly rescheduled. The custom runner is on by
+deadline is due and are then explicitly rescheduled. Native-tab reconciliation
+preserves an already-scheduled earlier deadline so repeated tab/window activity
+cannot postpone the 250 ms repair pass indefinitely. The custom runner is on by
 default and preserves the accepted interactive caps:
 
 - 16 ms while frame-active work is present;
@@ -203,8 +205,9 @@ PANERU_APPKIT_BLOCKING_WAIT=1 paneru
 
 This keeps the custom top-level runner but temporarily delegates the wait back to
 the AppKit blocking pump. By default, the custom runner now waits with its own
-CoreFoundation run-loop timer/source boundary and only drains pending AppKit
-NSEvents nonblocking after a wake.
+CoreFoundation run-loop timer/source boundary and drains pending AppKit NSEvents
+nonblocking after a wake. Paneru's external queue still keeps its conservative
+1 ms batching drain while native-tab burst behavior is being hardened.
 
 Fallback while testing adaptive idle only:
 
@@ -308,7 +311,7 @@ perf-06 added deterministic tests for the risks found during the loop spike:
 Existing perf-03 tests cover external event burst delivery and disconnected
 receiver behavior.
 
-perf-08 through perf-19 added deterministic coverage and validation tooling for
+perf-08 through perf-20 added deterministic coverage and validation tooling for
 the custom runner work:
 
 - pure runtime policy decisions for external events, dirty Bevy work, active
@@ -335,10 +338,11 @@ the custom runner work:
   reconciliation throttling.
 - Deferred perf-04 spike: computed long-idle deadlines inside `pump_events` were
   not shippable; see [`docs/perf-loop-spike-handoff.md`](perf-loop-spike-handoff.md).
-- New custom-runner work from perf-08 through perf-14: deterministic policy model,
+- New custom-runner work from perf-08 through perf-20: deterministic policy model,
   top-level runner, dedicated `CFRunLoopSource`/`CFRunLoopTimer` primitives,
-  dirty settle-loop, runner-visible deadline registry, adaptive idle, validation,
-  docs, and fallback knobs.
+  dirty settle-loop, runner-visible deadline registry, adaptive idle,
+  runner-owned CFRunLoop wait, deadline-source-of-truth migration, validation
+  tooling, docs, and fallback knobs.
 - Manual result on this branch: responsiveness felt good throughout reload and
   normal use; first-interaction sluggishness was fixed by resetting the timeout
   ramp after internal events; Ghostty native-tab close focus no longer reproduced
