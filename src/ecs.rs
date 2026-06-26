@@ -61,6 +61,7 @@ pub mod workspace;
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
     const LOW_POWER_MODE_CHECK_SEC: u64 = 60;
+    const NATIVE_TAB_RECONCILE_MS: u64 = 250;
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -158,7 +159,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
             systems::reconcile_tabbed_windows
                 .run_if(native_tabs_enabled)
-                .run_if(not_swiping),
+                .run_if(not_swiping)
+                .run_if(on_timer(Duration::from_millis(NATIVE_TAB_RECONCILE_MS))),
             crate::menubar::update_virtual_workspace_status_item.run_if(workspace_menu_status),
         ),
     );
