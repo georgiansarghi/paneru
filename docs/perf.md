@@ -174,7 +174,10 @@ made runner-visible `RuntimeDeadlines` the source of truth for critical watchdog
 and maintenance instead of hidden Bevy `on_timer(...)` state: lost-focus recovery,
 orphan workspace repair, refresh-window-sizes, low-power checks, periodic state
 save, periodic maintenance, and native-tab reconciliation all run when their named
-deadline is due and are then explicitly rescheduled. Native-tab reconciliation
+deadline is due and are then explicitly rescheduled. perf-21 hardened wake-source
+ownership: the main `CFRunLoopSource` is process-lifetime by design, while
+`EventSender` clones hold only a lightweight signal handle so final-drop cleanup
+cannot run source invalidation/removal from a background thread. Native-tab reconciliation
 preserves an already-scheduled earlier deadline so repeated tab/window activity
 cannot postpone the 250 ms repair pass indefinitely. The custom runner is on by
 default and preserves the accepted interactive caps:
