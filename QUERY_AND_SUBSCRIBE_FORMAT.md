@@ -135,7 +135,7 @@ Returns only the active display, workspace, and focused-window state.
 | `virtual_workspaces` | array | Virtual workspace rows known to Paneru. |
 | `number` | number | One-based virtual workspace number. |
 | `active` | boolean | Whether this virtual workspace is currently selected. |
-| `windows` | array | Managed windows in this virtual workspace row. |
+| `windows` | array | Managed windows in this virtual workspace row. Native macOS tab groups are represented by their focused/front tab only. |
 | `window_id` | number | Window id. |
 | `bundle_id` | string | Bundle id for the owning application, or an empty string if unknown. |
 | `app_name` | string | Display name for the owning application, or an empty string if unknown. |
