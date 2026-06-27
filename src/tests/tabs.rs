@@ -1,11 +1,17 @@
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::query::Has;
+use bevy::ecs::system::SystemState;
 use bevy::prelude::*;
 
 use crate::assert_window_size;
 use crate::commands::{Command, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::{ActiveWorkspaceMarker, Bounds, SpawnWindowTrigger};
+use crate::ecs::params::Windows;
+use crate::ecs::state::PaneruQueryState;
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, SpawnWindowTrigger};
 use crate::events::Event;
+use crate::manager::{Application, Display};
 use crate::platform::WinID;
 
 use super::*;
@@ -47,6 +53,65 @@ fn test_native_tab_detection() {
                 .expect("getting layout strip");
             assert!(strip.tabbed(follower));
             assert!(strip.tabbed(leader));
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_query_state_reports_native_tab_metadata() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |world, state| {
+            spawn_matching_native_tab(world, &state, 0);
+        })
+        .on_iteration(1, move |world, _state| {
+            let mut system_state: SystemState<(
+                Query<(&ChildOf, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+                Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+                Windows,
+                Query<&Application>,
+            )> = SystemState::new(world);
+            let (workspaces, displays, windows, apps) = system_state.get(world);
+            let state = PaneruQueryState::extract(&workspaces, &displays, &windows, &apps);
+            let active_workspace = state
+                .virtual_workspaces
+                .iter()
+                .find(|workspace| workspace.active)
+                .expect("active workspace should exist");
+
+            assert_eq!(active_workspace.windows.len(), 2);
+            let hidden = active_workspace
+                .windows
+                .iter()
+                .find(|window| window.window_id == 0)
+                .expect("hidden tab should exist");
+            let front = active_workspace
+                .windows
+                .iter()
+                .find(|window| window.window_id == 1)
+                .expect("front tab should exist");
+
+            assert!(!hidden.visible);
+            assert!(front.visible);
+            assert_eq!(hidden.native_tab, front.native_tab);
+            assert_eq!(
+                front.native_tab.as_ref().map(|tab| tab.front_window_id),
+                Some(1)
+            );
+            assert_eq!(
+                front
+                    .native_tab
+                    .as_ref()
+                    .map(|tab| tab.window_ids.as_slice()),
+                Some(&[0, 1][..])
+            );
         })
         .run(commands);
 }
