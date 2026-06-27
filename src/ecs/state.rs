@@ -446,8 +446,7 @@ impl PaneruQueryState {
         };
 
         for (child, strip, active_workspace) in workspaces {
-            let row_windows = strip
-                .all_windows()
+            let row_windows = query_window_entities(strip, focused_entity)
                 .iter()
                 .filter_map(|entity| {
                     let (window, _, unmanaged) = windows.get_managed(*entity)?;
@@ -538,6 +537,33 @@ impl PaneruQueryState {
     }
 }
 
+fn query_window_entities(strip: &LayoutStrip, focused_entity: Option<Entity>) -> Vec<Entity> {
+    strip
+        .columns()
+        .flat_map(|column| query_column_entities(column, focused_entity))
+        .collect()
+}
+
+fn query_column_entities(column: &Column, focused_entity: Option<Entity>) -> Vec<Entity> {
+    match column {
+        Column::Single(entity) | Column::Fullscren(entity) => vec![*entity],
+        Column::Tabs(tabs) => focused_or_first(tabs, focused_entity).into_iter().collect(),
+        Column::Stack(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                StackItem::Single(entity) => Some(*entity),
+                StackItem::Tabs(tabs) => focused_or_first(tabs, focused_entity),
+            })
+            .collect(),
+    }
+}
+
+fn focused_or_first(entities: &[Entity], focused_entity: Option<Entity>) -> Option<Entity> {
+    focused_entity
+        .filter(|focused| entities.contains(focused))
+        .or_else(|| entities.first().copied())
+}
+
 fn now_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -576,5 +602,65 @@ pub fn cleanup_on_exit(
         if let Err(e) = state.save_to_file(&path) {
             error!("Failed to save state on exit: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::world::World;
+
+    use super::*;
+
+    fn spawn_entities(world: &mut World, count: usize) -> Vec<Entity> {
+        (0..count).map(|_| world.spawn_empty().id()).collect()
+    }
+
+    #[test]
+    fn query_window_entities_uses_focused_native_tab_representative() {
+        let mut world = World::new();
+        let entities = spawn_entities(&mut world, 4);
+        let [single, first_tab, focused_tab, other_tab] = entities[..] else {
+            panic!("expected four entities");
+        };
+
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.append(single);
+        strip.insert_tab_group_at(1, &[first_tab, focused_tab, other_tab]);
+
+        assert_eq!(
+            query_window_entities(&strip, Some(focused_tab)),
+            vec![single, focused_tab]
+        );
+        assert_eq!(
+            query_window_entities(&strip, Some(single)),
+            vec![single, first_tab]
+        );
+        assert_eq!(query_window_entities(&strip, None), vec![single, first_tab]);
+    }
+
+    #[test]
+    fn query_window_entities_compacts_native_tabs_inside_stacks() {
+        let mut world = World::new();
+        let entities = spawn_entities(&mut world, 4);
+        let [tab_a, tab_b, stacked_single, trailing_single] = entities[..] else {
+            panic!("expected four entities");
+        };
+
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.insert_tab_group_at(0, &[tab_a, tab_b]);
+        strip.append(stacked_single);
+        strip
+            .stack(stacked_single)
+            .expect("stacking should succeed");
+        strip.append(trailing_single);
+
+        assert_eq!(
+            query_window_entities(&strip, Some(tab_b)),
+            vec![tab_b, stacked_single, trailing_single]
+        );
+        assert_eq!(
+            query_window_entities(&strip, None),
+            vec![tab_a, stacked_single, trailing_single]
+        );
     }
 }
