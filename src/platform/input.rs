@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use stdext::function_name;
 use tracing::{error, info};
 
-use crate::config::Config;
+use crate::config::{Config, swipe::SwipeGestureHorizontalAction};
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::platform::Modifiers;
@@ -383,7 +383,12 @@ impl InputHandler {
                 let y_sum: f64 = y_deltas.iter().sum();
 
                 if x_sum.abs() >= y_sum.abs() {
-                    // Horizontal dominant: use existing swipe path
+                    // Horizontal dominant: route by configured finger count.
+                    if self.config.swipe_gesture_horizontal_action(fingers.len())
+                        == SwipeGestureHorizontalAction::Disabled
+                    {
+                        return false;
+                    }
                     if x_deltas.iter().all(|p| p.abs() > SWIPE_THRESHOLD) {
                         _ = events.send(Event::Swipe { deltas: x_deltas });
                         self.last_swipe_time = Some(Instant::now());

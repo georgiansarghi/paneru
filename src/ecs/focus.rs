@@ -19,7 +19,8 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, ReshuffleAroundMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -159,7 +160,15 @@ fn autocenter_window_on_focus(
     if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
         return;
     }
-    if active_display.active_strip().tabbed(entity) {
+    if active_display.active_strip().tabbed(entity)
+        && windows.frame(entity).is_some_and(|frame| {
+            let bounds = active_display.bounds();
+            frame.min.x >= bounds.min.x
+                && frame.min.y >= bounds.min.y
+                && frame.max.x <= bounds.max.x
+                && frame.max.y <= bounds.max.y
+        })
+    {
         return;
     }
     if config.auto_center()
@@ -167,9 +176,25 @@ fn autocenter_window_on_focus(
         && let Some(size) = windows.size(entity)
         && let Some(mut origin) = windows.origin(entity)
     {
-        let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        commands.reposition_entity(entity, origin);
+        let viewport = active_display.actual_bounds(&config);
+        origin.x = viewport.center().x - size.x / 2;
+
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ReshuffleAroundMarker>();
+        }
+
+        if active_display.active_strip().contains(entity)
+            && let Some(layout_position) = windows.layout_position(entity)
+        {
+            // Managed windows live in the layout strip, so center by moving the
+            // strip just like the explicit Center command. Moving only the
+            // window is temporary and the next layout pass snaps it back.
+            let strip_position = (origin - layout_position.0).with_y(viewport.min.y);
+            commands.reposition_entity(active_display.active_strip_entity(), strip_position);
+        } else {
+            commands.reposition_entity(entity, origin);
+        }
+        return;
     }
     commands.reshuffle_around(entity);
 }

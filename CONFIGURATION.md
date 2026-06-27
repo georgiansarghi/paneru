@@ -63,9 +63,19 @@ Configure trackpad gestures and scroll-wheel window sliding.
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `fingers_count` | Integer | *None* | Number of fingers for the swipe gesture. Set to 3 or more to enable. |
+| `fingers_count` | Integer | *None* | Legacy/default finger count for swipe gestures. Set to 3 or more to enable. |
 | `direction` | String | `"Natural"` | Direction of movement: `"Natural"` or `"Reversed"`. |
+| `horizontal` | String or array of tables | `"Scroll"` | Horizontal gesture action. Shorthand values: `"Scroll"`, `"Focus"`, or `"Disabled"`. For multiple finger counts, use `[[swipe.gesture.horizontal]]` rules. |
+| `threshold` | Float | `0.15 / sensitivity` | Accumulated normalized delta required for one-shot gestures. Lower values are more sensitive. |
 | `vertical` | Boolean | `true` | Interpret the vertical gestures with `fingers_count` or ignore them. Enabling this allows using vertical swipe gestures to change virtual desktops. |
+
+### `[[swipe.gesture.horizontal]]`
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `fingers_count` | Integer | required | Number of fingers for this horizontal gesture rule. |
+| `action` | String | required | `"Scroll"` slides the strip, `"Focus"` focuses the previous/next column once per swipe, `"Disabled"` ignores/passes through the gesture. |
+| `sensitivity` | Float | `1.0` | Rule-specific multiplier for one-shot gesture sensitivity. Higher values require a shorter swipe. |
+| `threshold` | Float | `0.15 / ([swipe].sensitivity * sensitivity)` | Explicit accumulated normalized delta required to fire this rule. Lower values are more sensitive and override `sensitivity`. |
 
 ### `[swipe.scroll]`
 | Option | Type | Default | Description |
@@ -125,6 +135,8 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 | `window_focus_west` / `_east` | Focus window to the left/right. |
 | `window_focus_north` / `_south` | Focus window above/below. If no window exists, switches focus to the display in that direction. |
 | `window_focus_first` / `_last` | Jump to the start/end of the strip. |
+| `window_focus_<number>` | Focus the top window in a numbered strip column. |
+| `window_focusid_<window-id>` | Focus a visible window by macOS window id. Intended for scripts/status bars. |
 | `window_focus_managed` | Switch to a previously focused window on this workspace. |
 | `window_focus_unmanaged` | Switch to a previously focused floating window on this workspace. |
 | `window_swap_west` / `_east` | Swap current window with neighbor. |
@@ -151,6 +163,7 @@ Format: `"[modifiers-]key"`. Available modifiers are:
 ```toml
 [bindings]
 window_focus_west = "cmd - h"
+window_focus_3 = "cmd - 3"
 window_resize = ["alt - r", "ctrl - r"]
 ```
 
@@ -202,6 +215,10 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
 $ paneru send-cmd window virtual north
 # Move the current window to the next virtual workspace.
 $ paneru send-cmd window virtualmove south
+# Focus the top window in strip column 3.
+$ paneru send-cmd window focus 3
+# Focus a visible window by id from `paneru query virtual-workspaces`.
+$ paneru send-cmd window focusid 1781
 # Move directly to virtual workspace 3.
 $ paneru send-cmd window virtualnum 3
 # Move the current window to virtual workspace 3 and follow it.

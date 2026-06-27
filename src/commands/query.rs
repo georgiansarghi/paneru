@@ -2,7 +2,7 @@ use bevy::app::{App, PostUpdate, PreUpdate};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Added, Has};
+use bevy::ecs::query::{Added, Changed, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Query, Res, ResMut};
@@ -73,6 +73,7 @@ impl From<&PaneruActiveState> for FocusBroadcastSnapshot {
 #[derive(Clone, Copy, Default)]
 struct StateBroadcastSignals {
     virtual_workspace_changed: bool,
+    windows_changed: bool,
     window_focused: bool,
 }
 
@@ -94,6 +95,7 @@ impl StateBroadcastIntent {
     ) -> Self {
         let mut intent = Self {
             virtual_workspace_changed: signals.virtual_workspace_changed,
+            windows_changed: signals.windows_changed,
             window_focused: signals.window_focused,
             ..Self::default()
         };
@@ -111,7 +113,12 @@ impl StateBroadcastIntent {
                 | Event::Command {
                     command:
                         Command::Window(
-                            Operation::VirtualMove(_, _) | Operation::VirtualMoveNumber(_, _),
+                            Operation::Swap(_)
+                            | Operation::Stack(_)
+                            | Operation::Manage
+                            | Operation::ToNextDisplay(_)
+                            | Operation::VirtualMove(_, _)
+                            | Operation::VirtualMoveNumber(_, _),
                         ),
                 } => intent.windows_changed = true,
                 Event::WindowFocused { .. } => intent.window_focused = true,
@@ -274,6 +281,7 @@ fn collect_state_broadcast_events_for_intent(
             "event": "windows_changed",
             "virtual_workspace_number": state.active.virtual_workspace_number,
             "active": state.active.clone(),
+            "virtual_workspaces": state.virtual_workspaces.clone(),
         }));
         cache.virtual_workspaces = Some(state.virtual_workspaces.clone());
     }
@@ -322,6 +330,7 @@ fn state_event_broadcast_handler(
     workspaces: Query<(&ChildOf, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     focused_changes: Query<Entity, Added<FocusedMarker>>,
     active_workspace_changes: Query<Entity, Added<ActiveWorkspaceMarker>>,
+    layout_strip_changes: Query<Entity, Changed<LayoutStrip>>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
@@ -334,6 +343,7 @@ fn state_event_broadcast_handler(
 
     let signals = StateBroadcastSignals {
         virtual_workspace_changed: !active_workspace_changes.is_empty(),
+        windows_changed: !layout_strip_changes.is_empty(),
         window_focused: !focused_changes.is_empty(),
     };
     let intent = StateBroadcastIntent::from_events(events, signals);
@@ -377,6 +387,7 @@ fn state_event_broadcast_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{Direction, MoveFocus};
     use crate::ecs::state::{PaneruVirtualWorkspaceState, PaneruWindowState};
     use crate::events::Event as PaneruEvent;
 
@@ -515,6 +526,34 @@ mod tests {
     }
 
     #[test]
+    fn test_state_broadcast_emits_windows_changed_when_layout_strip_changes_without_event_message()
+    {
+        let state = query_state_with_active_window(
+            26_261,
+            "com.cmuxterm.app",
+            "term",
+            2,
+            vec![26_261, 26_262],
+        );
+        let mut cache = StateBroadcastCache::default();
+
+        let outgoing = collect_state_broadcast_events(
+            std::iter::empty(),
+            &state,
+            &mut cache,
+            |_| None,
+            StateBroadcastSignals {
+                windows_changed: true,
+                ..StateBroadcastSignals::default()
+            },
+        );
+
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0]["event"], "windows_changed");
+        assert_eq!(outgoing[0]["virtual_workspace_number"], 2);
+    }
+
+    #[test]
     fn test_state_broadcast_emits_focus_when_focused_marker_changes_without_event_message() {
         let state = query_state_with_active_window(
             26_262,
@@ -573,6 +612,18 @@ mod tests {
                 PaneruEvent::WindowMinimized { window_id: 10 },
                 PaneruEvent::WindowFocused { window_id: 11 },
                 PaneruEvent::WindowTitleChanged { window_id: 12 },
+                PaneruEvent::Command {
+                    command: Command::Window(Operation::Swap(Direction::West)),
+                },
+                PaneruEvent::Command {
+                    command: Command::Window(Operation::Stack(true)),
+                },
+                PaneruEvent::Command {
+                    command: Command::Window(Operation::Manage),
+                },
+                PaneruEvent::Command {
+                    command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+                },
                 PaneruEvent::DisplayResized { display_id: 2 },
             ]
             .iter(),
