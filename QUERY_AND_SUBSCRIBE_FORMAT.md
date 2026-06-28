@@ -149,6 +149,37 @@ Returns only the active display, workspace, and focused-window state.
 | `native_tab.front_window_id` | number | Window id of the front/visible member of this native tab group. |
 | `native_tab.window_ids` | array | Window ids in this native tab group. |
 
+For example, a native macOS tab group with window `456` in front may appear as:
+
+```json
+[
+  {
+    "window_id": 123,
+    "title": "hidden tab",
+    "focused": false,
+    "floating": false,
+    "visible": false,
+    "native_tab": {
+      "front_window_id": 456,
+      "window_ids": [123, 456, 789]
+    }
+  },
+  {
+    "window_id": 456,
+    "title": "front tab",
+    "focused": true,
+    "floating": false,
+    "visible": true,
+    "native_tab": {
+      "front_window_id": 456,
+      "window_ids": [123, 456, 789]
+    }
+  }
+]
+```
+
+Consumers that render visible layout slots can filter for `visible: true`.
+
 Paneru may include empty `windows` arrays for missing virtual workspace numbers
 inside a native workspace so integrations can render stable numbered slots.
 
