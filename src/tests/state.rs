@@ -566,6 +566,9 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
         json["virtual_workspaces"][0]["windows"][0]["bundle_id"],
         "test"
     );
-    assert_eq!(json["virtual_workspaces"][0]["windows"][0]["visible"], true);
-    assert!(json["virtual_workspaces"][0]["windows"][0]["native_tab"].is_null());
+    let window = json["virtual_workspaces"][0]["windows"][0]
+        .as_object()
+        .expect("window should serialize as an object");
+    assert_eq!(window["visible"], true);
+    assert!(window.get("native_tab").is_none());
 }
