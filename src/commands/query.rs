@@ -405,6 +405,8 @@ mod tests {
                 title: title.to_string(),
                 focused: active.focused_window_id == Some(window_id),
                 floating: false,
+                visible: true,
+                native_tab: None,
             })
             .collect();
 

@@ -136,6 +136,20 @@ pub struct PaneruWindowState {
     pub title: String,
     pub focused: bool,
     pub floating: bool,
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tab: Option<PaneruNativeTabState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PaneruNativeTabState {
+    pub front_window_id: WinID,
+    pub window_ids: Vec<WinID>,
+}
+
+const fn default_visible() -> bool {
+    true
 }
 
 impl From<IRect> for SavedRect {
@@ -446,11 +460,10 @@ impl PaneruQueryState {
         };
 
         for (child, strip, active_workspace) in workspaces {
-            let row_windows = strip
-                .all_windows()
+            let row_windows = query_window_entries(strip, focused_entity)
                 .iter()
-                .filter_map(|entity| {
-                    let (window, _, unmanaged) = windows.get_managed(*entity)?;
+                .filter_map(|entry| {
+                    let (window, _, unmanaged) = windows.get_managed(entry.entity)?;
                     let (_, _, app_entity) = windows.find_parent(window.id())?;
                     let app = apps.get(app_entity).ok()?;
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
@@ -461,8 +474,13 @@ impl PaneruQueryState {
                         bundle_id,
                         app_name,
                         title,
-                        focused: focused_entity == Some(*entity),
+                        focused: focused_entity == Some(entry.entity),
                         floating: unmanaged.is_some(),
+                        visible: entry.visible,
+                        native_tab: entry
+                            .native_tab
+                            .as_ref()
+                            .and_then(|tab| native_tab_state_for_entry(entry.entity, tab, windows)),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -538,6 +556,95 @@ impl PaneruQueryState {
     }
 }
 
+#[derive(Clone)]
+struct QueryWindowEntry {
+    entity: Entity,
+    visible: bool,
+    native_tab: Option<QueryNativeTabEntry>,
+}
+
+#[derive(Clone)]
+struct QueryNativeTabEntry {
+    group: Vec<Entity>,
+    front: Entity,
+}
+
+fn query_window_entries(
+    strip: &LayoutStrip,
+    focused_entity: Option<Entity>,
+) -> Vec<QueryWindowEntry> {
+    strip
+        .columns()
+        .flat_map(|column| query_column_entries(column, focused_entity))
+        .collect()
+}
+
+fn query_column_entries(column: &Column, focused_entity: Option<Entity>) -> Vec<QueryWindowEntry> {
+    match column {
+        Column::Single(entity) | Column::Fullscren(entity) => vec![normal_query_entry(*entity)],
+        Column::Tabs(tabs) => tab_query_entries(tabs, focused_entity),
+        Column::Stack(items) => items
+            .iter()
+            .flat_map(|item| match item {
+                StackItem::Single(entity) => vec![normal_query_entry(*entity)],
+                StackItem::Tabs(tabs) => tab_query_entries(tabs, focused_entity),
+            })
+            .collect(),
+    }
+}
+
+fn normal_query_entry(entity: Entity) -> QueryWindowEntry {
+    QueryWindowEntry {
+        entity,
+        visible: true,
+        native_tab: None,
+    }
+}
+
+fn tab_query_entries(entities: &[Entity], focused_entity: Option<Entity>) -> Vec<QueryWindowEntry> {
+    let Some(front) = front_tab_entity(entities, focused_entity) else {
+        return Vec::new();
+    };
+    let native_tab = QueryNativeTabEntry {
+        group: entities.to_vec(),
+        front,
+    };
+
+    entities
+        .iter()
+        .map(|entity| QueryWindowEntry {
+            entity: *entity,
+            visible: *entity == front,
+            native_tab: Some(native_tab.clone()),
+        })
+        .collect()
+}
+
+fn front_tab_entity(entities: &[Entity], focused_entity: Option<Entity>) -> Option<Entity> {
+    focused_entity
+        .filter(|focused| entities.contains(focused))
+        .or_else(|| entities.first().copied())
+}
+
+fn native_tab_state_for_entry(
+    _entity: Entity,
+    tab: &QueryNativeTabEntry,
+    windows: &Windows,
+) -> Option<PaneruNativeTabState> {
+    let front_window_id = windows.get(tab.front)?.id();
+    let mut window_ids = tab
+        .group
+        .iter()
+        .filter_map(|entity| windows.get(*entity).map(|window| window.id()))
+        .collect::<Vec<_>>();
+    window_ids.sort_unstable();
+
+    Some(PaneruNativeTabState {
+        front_window_id,
+        window_ids,
+    })
+}
+
 fn now_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -576,5 +683,82 @@ pub fn cleanup_on_exit(
         if let Err(e) = state.save_to_file(&path) {
             error!("Failed to save state on exit: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::ecs::world::World;
+
+    use super::*;
+
+    fn spawn_entities(world: &mut World, count: usize) -> Vec<Entity> {
+        (0..count).map(|_| world.spawn_empty().id()).collect()
+    }
+
+    #[test]
+    fn query_window_entries_marks_native_tab_front_visible() {
+        let mut world = World::new();
+        let entities = spawn_entities(&mut world, 4);
+        let [single, first_tab, focused_tab, other_tab] = entities[..] else {
+            panic!("expected four entities");
+        };
+
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.append(single);
+        strip.insert_tab_group_at(1, &[first_tab, focused_tab, other_tab]);
+
+        let entries = query_window_entries(&strip, Some(focused_tab));
+        assert_eq!(
+            entries.iter().map(|entry| entry.entity).collect::<Vec<_>>(),
+            vec![single, first_tab, focused_tab, other_tab]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.visible)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+        assert!(entries[0].native_tab.is_none());
+        assert!(entries[1..].iter().all(|entry| entry.native_tab.is_some()));
+        assert_eq!(
+            entries[2].native_tab.as_ref().map(|tab| tab.front),
+            Some(focused_tab)
+        );
+    }
+
+    #[test]
+    fn query_window_entries_marks_tabs_inside_stacks() {
+        let mut world = World::new();
+        let entities = spawn_entities(&mut world, 4);
+        let [tab_a, tab_b, stacked_single, trailing_single] = entities[..] else {
+            panic!("expected four entities");
+        };
+
+        let mut strip = LayoutStrip::new(1, 0);
+        strip.insert_tab_group_at(0, &[tab_a, tab_b]);
+        strip.append(stacked_single);
+        strip
+            .stack(stacked_single)
+            .expect("stacking should succeed");
+        strip.append(trailing_single);
+
+        let entries = query_window_entries(&strip, Some(tab_b));
+        assert_eq!(
+            entries.iter().map(|entry| entry.entity).collect::<Vec<_>>(),
+            vec![tab_a, tab_b, stacked_single, trailing_single]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.visible)
+                .collect::<Vec<_>>(),
+            vec![false, true, true, true]
+        );
+        assert!(entries[0].native_tab.is_some());
+        assert!(entries[1].native_tab.is_some());
+        assert!(entries[2].native_tab.is_none());
+        assert!(entries[3].native_tab.is_none());
     }
 }

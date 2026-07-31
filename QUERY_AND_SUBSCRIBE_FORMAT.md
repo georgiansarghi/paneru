@@ -58,7 +58,8 @@ Returns the complete state document.
           "app_name": "Terminal",
           "title": "paneru",
           "focused": true,
-          "floating": false
+          "floating": false,
+          "visible": true
         }
       ]
     }
@@ -95,7 +96,8 @@ Returns only the `virtual_workspaces` array from the complete state document.
         "app_name": "Terminal",
         "title": "paneru",
         "focused": true,
-        "floating": false
+        "floating": false,
+        "visible": true
       }
     ]
   }
@@ -135,13 +137,48 @@ Returns only the active display, workspace, and focused-window state.
 | `virtual_workspaces` | array | Virtual workspace rows known to Paneru. |
 | `number` | number | One-based virtual workspace number. |
 | `active` | boolean | Whether this virtual workspace is currently selected. |
-| `windows` | array | Managed windows in this virtual workspace row. |
+| `windows` | array | Managed windows in this virtual workspace row. Native macOS tab groups can include multiple entries for one visible layout slot. |
 | `window_id` | number | Window id. |
 | `bundle_id` | string | Bundle id for the owning application, or an empty string if unknown. |
 | `app_name` | string | Display name for the owning application, or an empty string if unknown. |
 | `title` | string | Window title, or an empty string if unknown. |
 | `focused` | boolean | Whether this window is focused. |
 | `floating` | boolean | Whether this window is unmanaged/floating. |
+| `visible` | boolean | Whether this window represents a visible layout slot. Hidden native-tab siblings are reported as `false`. |
+| `native_tab` | object, optional | Native macOS tab metadata. Omitted for non-tabbed windows. |
+| `native_tab.front_window_id` | number | Window id of the front/visible member of this native tab group. |
+| `native_tab.window_ids` | array | Window ids in this native tab group. |
+
+For example, a native macOS tab group with window `456` in front may appear as:
+
+```json
+[
+  {
+    "window_id": 123,
+    "title": "hidden tab",
+    "focused": false,
+    "floating": false,
+    "visible": false,
+    "native_tab": {
+      "front_window_id": 456,
+      "window_ids": [123, 456, 789]
+    }
+  },
+  {
+    "window_id": 456,
+    "title": "front tab",
+    "focused": true,
+    "floating": false,
+    "visible": true,
+    "native_tab": {
+      "front_window_id": 456,
+      "window_ids": [123, 456, 789]
+    }
+  }
+]
+```
+
+Consumers that render visible layout slots can filter for `visible: true`.
 
 Paneru may include empty `windows` arrays for missing virtual workspace numbers
 inside a native workspace so integrations can render stable numbered slots.

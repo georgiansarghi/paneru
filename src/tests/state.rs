@@ -553,6 +553,8 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
     assert_eq!(state.virtual_workspaces[0].windows[0].window_id, 0);
     assert_eq!(state.virtual_workspaces[0].windows[0].bundle_id, "test");
     assert!(state.virtual_workspaces[0].windows[0].focused);
+    assert!(state.virtual_workspaces[0].windows[0].visible);
+    assert!(state.virtual_workspaces[0].windows[0].native_tab.is_none());
     assert_eq!(state.virtual_workspaces[1].number, 2);
     assert!(state.virtual_workspaces[1].windows.is_empty());
     assert_eq!(state.virtual_workspaces[2].number, 3);
@@ -564,4 +566,9 @@ fn test_query_state_contract_exposes_active_virtual_workspace_and_windows() {
         json["virtual_workspaces"][0]["windows"][0]["bundle_id"],
         "test"
     );
+    let window = json["virtual_workspaces"][0]["windows"][0]
+        .as_object()
+        .expect("window should serialize as an object");
+    assert_eq!(window["visible"], true);
+    assert!(window.get("native_tab").is_none());
 }
